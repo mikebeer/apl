@@ -1,0 +1,8 @@
+apl
+*.o
+docs/*.pdf
+docs/_toc.json
+docs/pages.json
+docs/_snip.apl
+*.ws
+zzws.apl

@@ -1,0 +1,13 @@
+     Z<-FACT N
+     FACT defined.
+120
+3628800
+1
+     Z<-RFACT N
+     RFACT defined.
+720
+     COUNTDOWN N
+     COUNTDOWN defined.
+3
+2
+1

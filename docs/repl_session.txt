@@ -1,0 +1,26 @@
+APL-in-C  --  type )help for commands, )quit to exit
+apl> x <- iota 5
+apl> x times x
+1 4 9 16 25
+apl> reduce plus x
+15
+apl> nabla Z<-CUBE N
+     Z<-CUBE N
+[1]  Z<-N times N times N
+[2]  nabla
+     CUBE defined.
+apl> CUBE 3
+27
+apl> CUBE iota 4
+1 8 27 64
+apl> 1 divide 0
+apl: runtime error -- DOMAIN ERROR: divide by zero
+apl> m <- (2 3) rho iota 6
+apl> transpose m
+1 4
+2 5
+3 6
+apl> )vars
+m x
+apl> )quit
+goodbye.

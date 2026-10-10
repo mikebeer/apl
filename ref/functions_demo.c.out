@@ -1,0 +1,18 @@
+     Z<-SQUARE X
+     SQUARE defined.
+25
+1 4 9 16 25
+     Z<-A ADD B
+     ADD defined.
+7
+2 4 6
+     Z<-SUMSQ V
+     SUMSQ defined.
+30
+     Z<-AVG V;S;N
+     AVG defined.
+5.5
+     Z<-ANSWER
+     ANSWER defined.
+42
+47

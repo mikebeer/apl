@@ -1,0 +1,23 @@
+     Z<-SQ X
+     SQ defined.
+m t v
+Z<-SQ X
+CLEAR WS
+saved 3 variable(s) and 1 function(s) to zzws.apl
+zzws
+workspace cleared.
+(no variables defined)
+(no user-defined functions -- use nabla/edit to define one; see )PRIMS for built-ins)
+     Z<-SQ X
+     SQ defined.
+loaded zzws.apl
+m t v
+49
+1 2 3
+4 5 6
+hi mike
+erased: m
+apl: not found (no such variable or function): nosuch
+t v
+workspace id set to: foo
+foo

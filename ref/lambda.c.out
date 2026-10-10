@@ -1,0 +1,14 @@
+25
+1 4 9 16
+5
+2 3 4
+10
+3628800
+610
+5
+9
+sq <- { omega times omega }
+fac <- { ( omega = 0 ) : 1 ; omega times self omega minus 1 }
+fib <- { ( omega < 2 ) : omega ; ( self omega minus 1 ) plus self omega minus 2 }
+mean <- { ( reduce plus omega ) divide tally omega }
+f <- { t <- omega times 2 ; t plus 1 }

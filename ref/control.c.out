@@ -1,0 +1,16 @@
+     Z<-CLASSIFY N
+     CLASSIFY defined.
+     Z<-SUMTO N;I
+     SUMTO defined.
+     Z<-SQUARES V;X
+     SQUARES defined.
+     Z<-NAME D
+     NAME defined.
+negative
+zero
+positive
+5050
+1 4 16 25 36
+one
+few
+many

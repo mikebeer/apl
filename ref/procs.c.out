@@ -1,0 +1,16 @@
+  no.  processor   state
+    1  LOOPBACK    installed
+    2  UPPER       installed
+    3  COUNTER     installed
+  124  AP124       reserved, not installed
+  126  AP126       reserved, not installed
+  210  AP210       reserved, not installed
+1
+HELLO
+1
+1
+2
+101
+ N
+1
+5

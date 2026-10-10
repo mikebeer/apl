@@ -1,0 +1,12 @@
+     DEPOSIT N
+     DEPOSIT defined.
+     WITHDRAW N
+     WITHDRAW defined.
+     Z<-REPORT NAME
+     REPORT defined.
+Ann: 100
+Ann: 150
+Ann: 120
+Insufficient funds
+Ann: 120
+-1

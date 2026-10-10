@@ -1,0 +1,24 @@
+  no.  processor   state
+    1  LOOPBACK    installed
+    2  UPPER       installed
+    3  COUNTER     installed
+  124  AP124       reserved, not installed
+  126  AP126       reserved, not installed
+  210  AP210       reserved, not installed
+1
+HELLO
+1
+1
+2
+101
+1
+1
+quiet
+256
+ 1 0 1 1   12 0 3.5 -4
+caught
+11
+0.5
+0
+2
+apl: runtime error -- auxiliary processor 210 (AP210) is reserved but not installed

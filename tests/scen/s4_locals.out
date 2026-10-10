@@ -1,0 +1,17 @@
+     Z<-AVG V;S;N
+     AVG defined.
+2.5
+100
+2
+7
+     Z<-A ADD B
+     ADD defined.
+11 22 33
+     SHOW X
+     SHOW defined.
+5
+     P
+     P defined.
+in P
+     P
+[1]  'in P'

@@ -1,0 +1,12 @@
+     Z<-MEAN V
+     MEAN defined.
+     Z<-MEDIAN V;S;N
+     MEDIAN defined.
+     Z<-STDDEV V;D
+     STDDEV defined.
+5
+4.5
+2
+5.5
+5.5
+2.872281

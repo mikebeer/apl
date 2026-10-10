@@ -1,0 +1,19 @@
+     Z<-CLASSIFY N
+     CLASSIFY defined.
+     Z<-SUMTO N;I
+     SUMTO defined.
+     Z<-SQS V;X
+     SQS defined.
+     Z<-NAME D
+     NAME defined.
+     Z<-FIRSTSQ N
+     FIRSTSQ defined.
+negative
+zero
+positive
+5050
+1 4 16 25 36
+one
+few
+many
+51
