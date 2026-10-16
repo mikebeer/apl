@@ -7,13 +7,31 @@
 #define _POSIX_C_SOURCE 200112L
 #endif
 #define APL_HAVE_DIRENT 1
+#define APL_HAVE_SOCKETS 1
+#define APL_HAVE_TERMIOS 1
 #endif
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
 #include <math.h>
 #include <time.h>
+
+#ifdef APL_HAVE_SOCKETS
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <signal.h>
+#endif
+#ifdef APL_HAVE_TERMIOS
+#include <termios.h>
+#endif
 
 #ifdef __CMS__
 /* GCCLIB31's setjmp.h declares only jmp_buf; the routines are in assembler */

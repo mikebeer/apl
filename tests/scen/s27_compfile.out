@@ -1,0 +1,14 @@
+1
+4
+hello world
+3 1J2 4
+1 2 3
+4 5 6
+ ab   1 2 3   4 5
+4
+changed
+ ab   1 2 3   4 5
+3
+FILE ERROR: cannot open zz_nothere.dat (No such file or directory)
+FILE ERROR: the file already exists
+INDEX ERROR: no such component

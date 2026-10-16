@@ -18,4 +18,4 @@ rho []AV
 '1 divide 2' []EA '''x'''
 reduce plus 0 rho 0
 5 mod 12
-210 []SVO 'F'
+126 []SVO 'F'

@@ -2,9 +2,11 @@
     1  LOOPBACK    installed
     2  UPPER       installed
     3  COUNTER     installed
-  124  AP124       reserved, not installed
+  100  FILES       installed
+  124  SCREEN      installed
   126  AP126       reserved, not installed
-  210  AP210       reserved, not installed
+  160  TCP         installed
+  210  COMPFILE    installed
 1
 HELLO
 1
@@ -21,4 +23,4 @@ caught
 0.5
 0
 2
-apl: runtime error -- auxiliary processor 210 (AP210) is reserved but not installed
+apl: runtime error -- auxiliary processor 126 (AP126) is reserved but not installed

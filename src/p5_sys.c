@@ -833,11 +833,6 @@ static int run_stmt(const char *ln)
 #include <dirent.h>
 #endif
 
-static int cmp_str(const void *a, const void *b)
-{
-  return strcmp(*(char *const *)a, *(char *const *)b);
-}
-
 static char *ws_file_name(const char *name)
 {
   size_t n = strlen(name);

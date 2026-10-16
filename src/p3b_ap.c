@@ -127,14 +127,23 @@ static Arr *ctr_set(const char *var, Arr *val)
   return NULL;
 }
 
+static void ap_init_extra(void);
+
 static void ap_init(void)
 {
   ap_n = 0;
   ap_register(1, "LOOPBACK", 1, NULL, NULL, NULL, NULL);
   ap_register(2, "UPPER", 1, NULL, NULL, up_set, NULL);
   ap_register(3, "COUNTER", 1, NULL, ctr_get, ctr_set, NULL);
+  ap_init_extra();                 /* AP 100, 124, 160, 210 (p3d_proc.c) */
   /* numbers reserved for processors that are not written yet */
-  ap_register(124, "AP124", 0, NULL, NULL, NULL, NULL);
   ap_register(126, "AP126", 0, NULL, NULL, NULL, NULL);
-  ap_register(210, "AP210", 0, NULL, NULL, NULL, NULL);
+  {                                /* keep the table in processor-number order */
+    int i, j;
+    for (i = 1; i < ap_n; i++) {
+      ApProc t = ap_tab[i];
+      for (j = i - 1; j >= 0 && ap_tab[j].id > t.id; j--) ap_tab[j + 1] = ap_tab[j];
+      ap_tab[j + 1] = t;
+    }
+  }
 }

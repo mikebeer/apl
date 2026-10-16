@@ -10,7 +10,7 @@ apl: apl_all.c
 
 # the single-file form is generated from src/ (this is what to ship to
 # platforms that want one source file, e.g. VM/370 CMS)
-apl_all.c: src/apl.c src/p0_base.c src/p1_val.c src/p2_lex.c src/p3_prim.c src/p3b_ap.c src/p3c_fmt.c \
+apl_all.c: src/apl.c src/p0_base.c src/p1_val.c src/p2_lex.c src/p3_prim.c src/p3b_ap.c src/p3c_fmt.c src/p3d_proc.c \
            src/p4_eval.c src/p4b_oo.c src/p5_sys.c src/p5b_oosys.c tools/amalg.sh
 	sh tools/amalg.sh > apl_all.c
 

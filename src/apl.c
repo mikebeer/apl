@@ -9,6 +9,7 @@
 #include "p3_prim.c"
 #include "p3b_ap.c"
 #include "p3c_fmt.c"
+#include "p3d_proc.c"
 #include "p4_eval.c"
 #include "p4b_oo.c"
 #include "p5_sys.c"

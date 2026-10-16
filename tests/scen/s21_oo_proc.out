@@ -19,9 +19,11 @@
     1  LOOPBACK    installed
     2  UPPER       installed
     3  COUNTER     installed
-  124  AP124       reserved, not installed
+  100  FILES       installed
+  124  SCREEN      installed
   126  AP126       reserved, not installed
-  210  AP210       reserved, not installed
+  160  TCP         installed
+  210  COMPFILE    installed
   1000  OBJECT      installed
          shares: X
     7  OBJECT      installed
@@ -40,9 +42,11 @@ workspace cleared.
     1  LOOPBACK    installed
     2  UPPER       installed
     3  COUNTER     installed
-  124  AP124       reserved, not installed
+  100  FILES       installed
+  124  SCREEN      installed
   126  AP126       reserved, not installed
-  210  AP210       reserved, not installed
+  160  TCP         installed
+  210  COMPFILE    installed
      Offer V
      Offer defined.
      R<-Get V
@@ -61,9 +65,11 @@ loaded s21ws.apl
          shares: U
     3  COUNTER     installed
          shares: C
-  124  AP124       reserved, not installed
+  100  FILES       installed
+  124  SCREEN      installed
   126  AP126       reserved, not installed
-  210  AP210       reserved, not installed
+  160  TCP         installed
+  210  COMPFILE    installed
   1000  OBJECT      installed
     7  OBJECT      installed
          shares: Y

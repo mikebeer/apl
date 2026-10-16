@@ -1,0 +1,23 @@
+1
+1
+28
+first line
+second
+0
+no newline
+0
+1
+first
+5
+first line
+second
+no newline
+3 10
+28
+0
+FILE ERROR: cannot open nonexistent_dir/x (No such file or directory)
+DOMAIN ERROR: FILES has no command bogus
+DOMAIN ERROR: a request is a command text, or a vector that starts with one
+0
+zz_d1.txt
+zz_d2.txt
