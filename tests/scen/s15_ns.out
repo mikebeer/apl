@@ -1,0 +1,45 @@
+     R<-Twice X
+     Twice defined.
+     R<-AddK X
+     AddK defined.
+42
+15
+49
+105
+     R<-ViaRoot X
+     ViaRoot defined.
+#.Util
+1001
+#
+deep
+A A.B Util
+A
+Util
+k
+AddK
+Square
+Twice
+3
+2
+9.1
+1 2 3
+#.Other
+1
+6
+#.[Namespace]
+12
+p
+q
+#.Util
+100
+8
+k
+R<-Twice X
+R<-AddK X
+Square <- { omega times omega }
+#
+g n x
+5
+1
+A A.B Other
+0

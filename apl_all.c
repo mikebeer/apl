@@ -139,6 +139,8 @@ static int interactive = 0;   /* 1 when reading a terminal REPL */
 #define T_CHR 1
 #define T_NEST 2
 
+struct Scope;                  /* namespace / class / instance (p4b_oo.c) */
+
 typedef struct Arr {
   struct Arr *next, *prev;     /* list of all live arrays (for sweeping) */
   int refc;
@@ -150,6 +152,7 @@ typedef struct Arr {
   char *chr;                   /* T_CHR data (n+1 bytes, NUL terminated) */
   struct Arr **sub;            /* T_NEST items */
   int mark;
+  struct Scope *obj;           /* set on an object-reference handle vector */
 } Arr;
 
 static Arr *all_arrs = NULL;
@@ -176,6 +179,7 @@ static Arr *a_new(int type, int rank, const int *shape)
   a->chr = NULL;
   a->sub = NULL;
   a->mark = 0;
+  a->obj = NULL;
   if (type == T_NUM) {
     a->num = (double *)xmalloc(sizeof(double) * (size_t)a->n);
   } else if (type == T_CHR) {
@@ -198,9 +202,12 @@ static void a_unlink(Arr *a)
   if (a->next) a->next->prev = a->prev;
 }
 static void a_rel(Arr *a);
+static void obj_release(struct Scope *s);
+static const char *obj_text(const struct Scope *s);
 static void a_free(Arr *a)
 {
   a_unlink(a);
+  if (a->obj) obj_release(a->obj);
   if (a->sub) {
     int i;
     for (i = 0; i < a->n; i++) a_rel(a->sub[i]);
@@ -381,6 +388,7 @@ static void sweep_unmarked(void)
     nx = a->next;
     if (!a->mark) {
       a_unlink(a);
+      if (a->obj) obj_release(a->obj);
       free(a->sub); free(a->num); free(a->chr); free(a);
     } else a->mark = 0;
     a = nx;
@@ -621,6 +629,9 @@ static Blk *render_nest(const Arr *a)
 
 static Blk *render(const Arr *a)
 {
+  if (a->obj) return blk_text(obj_text(a->obj));
+  if (a->type == T_NEST && a->rank == 0 && a->sub[0] && a->sub[0]->obj)
+    return blk_text(obj_text(a->sub[0]->obj));
   return (a->type == T_NEST) ? render_nest(a) : render_simple(a);
 }
 
@@ -728,6 +739,14 @@ static Tok *lex(const char *line)
       while (is_alnum((unsigned char)*q)) q++;
       len = (int)(q - p);
       if (len == 4 && strncmp(p, "lamp", 4) == 0) break;   /* comment */
+      /* dotted path:  ns.name   obj.member   obj.[]NL */
+      while (*q == '.' && (is_alpha((unsigned char)q[1]) ||
+             (q[1] == '[' && q[2] == ']' && is_alpha((unsigned char)q[3])))) {
+        q++;
+        if (*q == '[') q += 2;
+        while (is_alnum((unsigned char)*q)) q++;
+      }
+      len = (int)(q - p);
       k = K_NAME;
       s = xstrndup(p, len);
       p = q;
@@ -766,6 +785,15 @@ static Tok *lex(const char *line)
         const char *b = q;
         while (is_alnum((unsigned char)*q)) q++;
         k = K_QNAME;
+        if (*q == '.' && is_alpha((unsigned char)q[1])) {
+          /* []THIS.member, []ROOT.name ...: a dotted path (K_NAME) */
+          while (*q == '.' && is_alpha((unsigned char)q[1])) {
+            q++;
+            while (is_alnum((unsigned char)*q)) q++;
+          }
+          k = K_NAME;
+          s = xstrndup(p, (int)(q - p));
+        } else
         s = xstrndup(b, (int)(q - b));
       } else {
         k = K_QUAD;
@@ -773,13 +801,16 @@ static Tok *lex(const char *line)
       p = q;
     } else {
       const char *sym = NULL;
-      if (p[0] == '<' && p[1] == '-') sym = "<-";
+      if (p[0] == '.' && n > 0 && is_alpha((unsigned char)p[1]) &&
+          t[n - 1].k == K_SYM &&
+          (t[n - 1].s[0] == ')' || t[n - 1].s[0] == ']') && !t[n - 1].s[1]) sym = ".";
+      else if (p[0] == '<' && p[1] == '-') sym = "<-";
       else if (p[0] == '-' && p[1] == '>') sym = "->";
       else if (p[0] == '<' && p[1] == '=') sym = "<=";
       else if (p[0] == '>' && p[1] == '=') sym = ">=";
       else if (p[0] == '<' && p[1] == '>') sym = "<>";
       if (sym) {
-        k = K_SYM; s = xstrdup(sym); p += 2;
+        k = K_SYM; s = xstrdup(sym); p += strlen(sym);
       } else if (strchr("+-*/<>=();:[]{}", *p)) {
         char one[2];
         one[0] = *p; one[1] = '\0';
@@ -2740,7 +2771,7 @@ static Arr *prim_dya(int id, Arr *x, Arr *y)
  *                       in place of `value`, or NULL to keep `value`
  *   retract(name)       called when the offer ends
  */
-#define AP_MAXPROC 32
+#define AP_MAXPROC 64
 
 typedef struct ApProc {
   int id;
@@ -2750,6 +2781,8 @@ typedef struct ApProc {
   Arr *(*get)(const char *var);
   Arr *(*set)(const char *var, Arr *val);
   void (*retract)(const char *var);
+  int objid;                           /* >0: an object acts as the processor */
+  Arr *oref;                           /* ... and this keeps it alive */
 } ApProc;
 
 static ApProc ap_tab[AP_MAXPROC];
@@ -2766,7 +2799,14 @@ static void ap_register(int id, const char *name, int installed,
   p = &ap_tab[ap_n++];
   p->id = id; p->name = name; p->installed = installed;
   p->offer = offer; p->get = get; p->set = set; p->retract = retract;
+  p->objid = 0; p->oref = NULL;
 }
+
+/* processors that are objects (p4b_oo.c / p5b_oosys.c) */
+static void obj_ap_offer(const ApProc *p, const char *var);
+static Arr *obj_ap_get(const ApProc *p, const char *var);
+static Arr *obj_ap_set(const ApProc *p, const char *var, Arr *val);
+static void obj_ap_retract(const ApProc *p, const char *var);
 
 static ApProc *ap_find(int id)
 {
@@ -2789,21 +2829,25 @@ static void ap_do_offer(int id, const char *var)
             id, p->name);
     rt_error(buf);
   }
+  if (p->objid) { obj_ap_offer(p, var); return; }
   if (p->offer) p->offer(var);
 }
 static Arr *ap_do_get(int id, const char *var)
 {
   ApProc *p = ap_find(id);
+  if (p && p->objid) return obj_ap_get(p, var);
   return (p && p->get) ? p->get(var) : NULL;
 }
 static Arr *ap_do_set(int id, const char *var, Arr *val)
 {
   ApProc *p = ap_find(id);
+  if (p && p->objid) return obj_ap_set(p, var, val);
   return (p && p->set) ? p->set(var, val) : NULL;
 }
 static void ap_do_retract(int id, const char *var)
 {
   ApProc *p = ap_find(id);
+  if (p && p->objid) { obj_ap_retract(p, var); return; }
   if (p && p->retract) p->retract(var);
 }
 
@@ -2853,8 +2897,14 @@ static void ap_init(void)
 /* p4_eval.c - variables, user functions, parser/evaluator, operators */
 
 /* ---------- variables ---------- */
+/* The workspace keeps one table of variables and one list of functions,
+ * both keyed by an absolute key.  The root (classic APL) workspace uses the
+ * plain name.  A namespace, class or instance (p4b_oo.c) owns a key prefix
+ * ("Util.", "Account.", "\1I7.") so its members are ordinary table entries
+ * with a qualified key.  cur_scope selects the scope that unqualified names
+ * are looked up in (NULL = root = exactly the classic behaviour). */
 typedef struct Var {
-  char *name;
+  char *name;              /* absolute key */
   Arr *val;
   int ap;                  /* processor this variable is shared with, or 0 */
   struct Var *next;
@@ -2862,12 +2912,36 @@ typedef struct Var {
 #define HSIZE 211
 static Var *vtab[HSIZE];
 
+struct Scope;
+struct Fn;
+struct Member;
+static struct Scope *cur_scope = NULL;  /* NULL: root workspace */
+static struct Scope *cur_owner = NULL;  /* class of the running method */
+static Arr *prop_tmp = NULL;            /* last property-getter result */
+
+#define KEYMAX 300
+#define R_NONE 0
+#define R_VAR 1       /* a variable: key */
+#define R_FN 2        /* a function / bound method: fn */
+#define R_SCOPE 3     /* a namespace, class, interface or instance: sc */
+#define R_PROP 4      /* a property of sc: mem, decl */
+#define R_QUAD 5      /* obj.[]NAME: qname applies to sc */
+typedef struct Res {
+  int kind;
+  char key[KEYMAX];
+  struct Fn *fn;
+  struct Scope *sc, *decl;
+  struct Member *mem;
+  char qname[32];
+} Res;
+
 static unsigned hashname(const char *s)
 {
   unsigned h = 5381u;
   while (*s) h = h * 33u + (unsigned char)*s++;
   return h % HSIZE;
 }
+static void oo_note_var(const char *key);
 static Var *var_find(const char *name, int create)
 {
   unsigned h = hashname(name);
@@ -2881,40 +2955,88 @@ static Var *var_find(const char *name, int create)
   v->ap = 0;
   v->next = vtab[h];
   vtab[h] = v;
+  if (name[0] == '\1') oo_note_var(name);
   return v;
 }
-static Arr *var_get(const char *name)
+/* scope-aware resolution (p4b_oo.c).  mode: 0 read, 1 write/delete an
+ * existing name, 2 write (create when absent).  Returns 0 if not found. */
+static int oo_find(const char *name, int mode, Res *r);
+static Arr *oo_prop_read(Res *r);
+static void oo_prop_write(Res *r, Arr *a);
+static char *oo_local_key(const char *name);
+static char *oo_fn_key(const char *name);
+
+static Arr *var_value(Var *v)
 {
-  Var *v = var_find(name, 0);
-  if (!v) return NULL;
   if (v->ap) {
-    Arr *g = ap_do_get(v->ap, name);
+    Arr *g = ap_do_get(v->ap, v->name);
     if (g) { a_rel(v->val); v->val = g; }
   }
   return v->val;
 }
-/* takes ownership of one reference to a (may be NULL: unbind) */
-static void var_set(const char *name, Arr *a)
+static Arr *var_get(const char *name)
 {
-  Var *v = var_find(name, a != NULL);
-  if (!v) return;
+  Var *v;
+  if (cur_scope || strchr(name, '.')) {
+    Res r;
+    if (!oo_find(name, 0, &r)) return NULL;
+    if (r.kind == R_PROP) return oo_prop_read(&r);
+    if (r.kind != R_VAR) return NULL;
+    v = var_find(r.key, 0);
+  } else v = var_find(name, 0);
+  if (!v) return NULL;
+  return var_value(v);
+}
+/* store through an exact Var; takes ownership of one reference to a */
+static void var_store(Var *v, Arr *a)
+{
   if (v->ap) {
     if (a) {
-      Arr *rep = ap_do_set(v->ap, name, a);
+      Arr *rep = ap_do_set(v->ap, v->name, a);
       if (rep) { a_rel(a); a = rep; }
     } else {
       int id = v->ap;
       v->ap = 0;
-      ap_do_retract(id, name);
+      ap_do_retract(id, v->name);
     }
   }
   a_rel(v->val);
   v->val = a;
 }
-/* detach the current value (caller owns it) */
-static Arr *var_take(const char *name)
+/* takes ownership of one reference to a (may be NULL: unbind) */
+static void var_set(const char *name, Arr *a)
 {
-  Var *v = var_find(name, 0);
+  Var *v;
+  if (cur_scope || strchr(name, '.')) {
+    Res r;
+    if (!oo_find(name, a != NULL ? 2 : 1, &r)) {
+      if (a) { a_rel(a); rt_error_s("VALUE ERROR: no such member: ", name, ""); }
+      return;
+    }
+    if (r.kind == R_PROP) {
+      if (!a) rt_error("DOMAIN ERROR: a property cannot be expunged");
+      oo_prop_write(&r, a);
+      return;
+    }
+    if (r.kind != R_VAR) {
+      if (a) { a_rel(a); rt_error_s("DOMAIN ERROR: cannot assign to ", name, ""); }
+      return;
+    }
+    v = var_find(r.key, a != NULL);
+  } else v = var_find(name, a != NULL);
+  if (!v) return;
+  var_store(v, a);
+}
+/* exact-key variants (frames restore by absolute key) */
+static void var_set_key(const char *key, Arr *a)
+{
+  Var *v = var_find(key, a != NULL);
+  if (!v) return;
+  var_store(v, a);
+}
+static Arr *var_take_key(const char *key)
+{
+  Var *v = var_find(key, 0);
   Arr *a;
   if (!v) return NULL;
   a = v->val;
@@ -2924,7 +3046,8 @@ static Arr *var_take(const char *name)
 
 /* ---------- user functions ---------- */
 typedef struct Fn {
-  char *name;
+  char *name;                /* short name */
+  char *key;                 /* absolute key (== name in the root) */
   int arity;                 /* 0, 1, 2 */
   char *res, *left, *right;  /* NULL when absent */
   char *hdr;                 /* header text as shown */
@@ -2942,11 +3065,18 @@ typedef struct Fn {
   Tok *optok;                /* its body tokens (END-terminated) */
   int cbuilt, hasctl;        /* structured control flow tables */
   int *ck, *cj;              /* kind per line; jump targets (3 per line) */
+  struct Scope *sc;          /* home: namespace, or class of a method */
+  int mflag;                 /* method attributes (F_xxx in p4b_oo.c) */
+  struct Fn *master;         /* bound copy of this method ... */
+  struct Scope *bsc;         /* ... running in this instance/class scope */
 } Fn;
 
 /* ---------- localization frames ---------- */
-typedef struct Saved { const char *name; Arr *val; } Saved;
-typedef struct Frame { Fn *fn; int nsaved; Saved *sv; } Frame;
+typedef struct Saved { char *key; Arr *val; } Saved;
+typedef struct Frame {
+  Fn *fn; int nsaved; Saved *sv;
+  struct Scope *ssc, *sow;   /* caller's scope and owner class */
+} Frame;
 static Frame frames[MAXDEPTH + 2];
 static int fdepth = 0;
 
@@ -2955,30 +3085,42 @@ static void unwind_frames(int depth)
   while (fdepth > depth) {
     Frame *fr = &frames[--fdepth];
     int i;
-    for (i = fr->nsaved - 1; i >= 0; i--)
-      var_set(fr->sv[i].name, fr->sv[i].val);
+    for (i = fr->nsaved - 1; i >= 0; i--) {
+      var_set_key(fr->sv[i].key, fr->sv[i].val);
+      free(fr->sv[i].key);
+    }
     free(fr->sv);
+    cur_scope = fr->ssc;
+    cur_owner = fr->sow;
   }
 }
 
 static Fn **fns = NULL;
 static int nfns = 0;
 
-static Fn *fn_find(const char *name)
+static Fn *fn_find_key(const char *key)
 {
   int i;
+  for (i = 0; i < nfns; i++)
+    if (strcmp(fns[i]->key, key) == 0) return fns[i];
+  return NULL;
+}
+static Fn *oo_fn(const char *name);
+static Fn *fn_find(const char *name)
+{
   if (name[0] == 's' && strcmp(name, "self") == 0) {
     if (fdepth > 0 && frames[fdepth - 1].fn->lam) return frames[fdepth - 1].fn;
     return NULL;
   }
-  for (i = 0; i < nfns; i++)
-    if (strcmp(fns[i]->name, name) == 0) return fns[i];
-  return NULL;
+  if (cur_scope || strchr(name, '.')) return oo_fn(name);
+  return fn_find_key(name);
 }
 static void fn_free(Fn *f)
 {
   int i;
-  free(f->name); free(f->res); free(f->left); free(f->right); free(f->hdr);
+  if (f->master) { free(f->name); free(f->key); free(f); return; }
+  free(f->name); free(f->key); free(f->res); free(f->left); free(f->right);
+  free(f->hdr);
   for (i = 0; i < f->nloc; i++) free(f->loc[i]);
   free(f->loc);
   for (i = 1; i <= f->nlines; i++) {
@@ -2996,8 +3138,9 @@ static void fn_free(Fn *f)
 static void fn_install(Fn *f)
 {
   int i;
+  if (!f->key) f->key = xstrdup(f->name);
   for (i = 0; i < nfns; i++)
-    if (strcmp(fns[i]->name, f->name) == 0) {
+    if (strcmp(fns[i]->key, f->key) == 0) {
       fn_free(fns[i]);
       fns[i] = f;
       return;
@@ -3005,17 +3148,27 @@ static void fn_install(Fn *f)
   fns = (Fn **)xrealloc(fns, sizeof(Fn *) * (size_t)(nfns + 1));
   fns[nfns++] = f;
 }
-static int fn_remove(const char *name)
+static int fn_remove_key(const char *key)
 {
   int i;
   for (i = 0; i < nfns; i++)
-    if (strcmp(fns[i]->name, name) == 0) {
+    if (strcmp(fns[i]->key, key) == 0) {
       fn_free(fns[i]);
       for (; i + 1 < nfns; i++) fns[i] = fns[i + 1];
       nfns--;
       return 1;
     }
   return 0;
+}
+static int fn_remove(const char *name)
+{
+  char *k;
+  int r;
+  if (!cur_scope && !strchr(name, '.')) return fn_remove_key(name);
+  k = oo_fn_key(name);
+  r = fn_remove_key(k);
+  free(k);
+  return r;
 }
 
 /* ---------- branch state ---------- */
@@ -3043,6 +3196,14 @@ static Fn *lambda_at(Ps *p, int *ntok);
 static int brace_end(const Tok *t, int i);
 static Fn *lambda_make(const Tok *t, int a, int b, const char *name);
 static Arr *call_fn(Fn *f, Arr *left, Arr *right);
+static void oo_enter(Frame *fr, Fn *bound);
+static int oo_quad_dya(const char *name);
+static Arr *quad_dya(const char *name, Arr *x, Arr *y);
+static Arr *oo_quad_in(const char *path, Arr *x);
+static Arr *oo_name_value(const char *name);
+static Arr *oo_quad_value(const char *name);
+static int oo_member_of(Arr *obj, const char *path, Res *r);
+static void fn_install_here(Fn *f);
 static Arr *eval_text(const char *s);
 
 static Arr *need_val(Arr *a)
@@ -3489,6 +3650,10 @@ static Arr *quad_value(const char *name)
     if (strncmp(errkind, "syntax", 6) == 0) return a_scalar(2.0);
     return a_scalar(11.0);
   }
+  {
+    Arr *o = oo_quad_value(name);
+    if (o) return o;
+  }
   syn_error_s("unknown system name: []", name);
   return NULL;
 }
@@ -3602,6 +3767,58 @@ static void unexpected(const Tok *t)
   syn_error(buf);
 }
 
+/* index of the ")" matching the "(" at i, or -1 */
+static int paren_end(const Tok *t, int i)
+{
+  int d = 0;
+  for (; t[i].k != K_END; i++) {
+    if (tok_sym(&t[i], "(")) d++;
+    else if (tok_sym(&t[i], ")") && --d == 0) return i;
+  }
+  return -1;
+}
+
+/* (expr).member   p->i is at the "." ; obj is consumed */
+static Arr *member_access(Ps *p, Arr *obj, int allow_args, Fn **mfn)
+{
+  Res r;
+  const char *name;
+  Arr *v = NULL, *res;
+  p->i++;
+  name = p->t[p->i].s;
+  p->i++;
+  if (!oo_member_of(obj, name, &r)) {
+    a_rel(obj);
+    rt_error_s("VALUE ERROR: no such member: ", name, "");
+  }
+  if (r.kind == R_VAR) {
+    Var *var = var_find(r.key, 0);
+    v = var ? var_value(var) : NULL;
+    if (!v) { a_rel(obj); rt_error_s("VALUE ERROR: member has no value: ", name, ""); }
+    res = a_ref(v);
+  } else if (r.kind == R_PROP) {
+    res = a_ref(oo_prop_read(&r));
+  } else if (r.kind == R_FN) {
+    Fn *f = r.fn;
+    if (allow_args && (f->arity >= 1 || f->ambi)) {
+      *mfn = f;
+      return obj;                         /* the caller applies it */
+    }
+    if (f->arity != 0) {
+      a_rel(obj);
+      syn_error_s("a method that takes an argument cannot be used here: ", name);
+    }
+    res = call_fn(f, NULL, NULL);
+    if (!res) { a_rel(obj); syn_error_s("method returned no value: ", name); }
+  } else {
+    a_rel(obj);
+    rt_error_s("DOMAIN ERROR: not a value: ", name, "");
+    res = NULL;
+  }
+  a_rel(obj);
+  return res;
+}
+
 static Arr *parse_item0(Ps *p)
 {
   Tok *t = &p->t[p->i];
@@ -3628,6 +3845,10 @@ static Arr *parse_item0(Ps *p)
       syn_error("missing closing parenthesis");
     }
     p->i++;
+    if (tok_sym(&p->t[p->i], ".") && p->t[p->i + 1].k == K_NAME) {
+      Fn *dummy = NULL;
+      a = member_access(p, a, 0, &dummy);
+    }
     return a;
   }
   if (t->k == K_QUAD || tok_name(t, "quad")) {
@@ -3649,7 +3870,11 @@ static Arr *parse_item0(Ps *p)
     if (strcmp(t->s, "zilch") == 0) { p->i++; return a_vec(T_NUM, 0); }
     if (reserved_word(t->s)) unexpected(t);
     v = var_get(t->s);
-    if (!v) syn_error_s("undefined variable: ", t->s);
+    if (!v) {
+      Arr *ob = oo_name_value(t->s);        /* a class / namespace name */
+      if (ob) { p->i++; return ob; }
+      syn_error_s("undefined variable: ", t->s);
+    }
     p->i++;
     return a_ref(v);
   }
@@ -3765,12 +3990,14 @@ static Arr *build_strand(Arr **it, int n)
 /* strand items are collected on a global stack so that an error raised
  * while parsing a later item cannot leak a malloc'd buffer */
 
-static Arr *parse_operand(Ps *p)
+static Arr *parse_operand_from(Ps *p, Arr *first)
 {
   int base = sstop, n;
   Arr *r;
   for (;;) {
-    Arr *a = parse_item(p);
+    Arr *a;
+    if (first) { a = first; first = NULL; }
+    else a = parse_item(p);
     if (sstop == sscap) {
       sscap = sscap ? sscap * 2 : 64;
       sstk = (Arr **)xrealloc(sstk, sizeof(Arr *) * (size_t)sscap);
@@ -3991,6 +4218,7 @@ static int dyadic_at(Ps *p, FnRef *f, int *ea)
   *ea = 0;
   if (t->k == K_QNAME && strcmp(t->s, "EA") == 0) { *ea = 1; f->ntok = 1; return 1; }
   if (t->k == K_QNAME && strcmp(t->s, "SVO") == 0) { *ea = 2; f->ntok = 1; return 1; }
+  if (t->k == K_QNAME && oo_quad_dya(t->s)) { *ea = 3; f->ntok = 1; return 1; }
   if (tok_sym(t, "{")) {
     int nt;
     Fn *u = lambda_at(p, &nt);
@@ -4030,12 +4258,22 @@ static Arr *parse_expr(Ps *p)
   Arr *a, *r, *res;
   FnRef f;
   int ea;
+  const char *qdn;
   /* leading function => monadic application */
   if (t->k == K_SYM && (strcmp(t->s, "+") == 0 || strcmp(t->s, "-") == 0)) {
     int id = (t->s[0] == '+') ? P_ADD : P_SUB;
     p->i++;
     r = need_val(parse_expr(p));
     res = prim_mon(id, r);
+    a_rel(r);
+    return res;
+  }
+  if (t->k == K_NAME && strstr(t->s, ".[]") != NULL) {
+    /* obj.[]NL x : a system function evaluated in the scope obj */
+    const char *qn = t->s;
+    p->i++;
+    r = need_val(parse_expr(p));
+    res = oo_quad_in(qn, r);
     a_rel(r);
     return res;
   }
@@ -4090,7 +4328,42 @@ static Arr *parse_expr(Ps *p)
       }
     }
   }
-  a = parse_operand(p);
+  {
+    Arr *pre = NULL;
+    if (tok_sym(&p->t[p->i], "(")) {
+      int e = paren_end(p->t, p->i);
+      if (e > 0 && tok_sym(&p->t[e + 1], ".") && p->t[e + 2].k == K_NAME) {
+        Arr *obj;
+        Fn *mf = NULL;
+        p->i++;
+        obj = need_val(parse_expr(p));
+        if (!tok_sym(&p->t[p->i], ")")) {
+          a_rel(obj);
+          syn_error("missing closing parenthesis");
+        }
+        p->i++;
+        obj = member_access(p, obj, 1, &mf);
+        if (mf) {
+          Arr *rarg = need_val(parse_expr(p));
+          res = call_fn(mf, NULL, rarg);
+          a_rel(rarg);
+          a_rel(obj);
+          return res;
+        }
+        pre = obj;
+        while (tok_sym(&p->t[p->i], "[")) {
+          Arr *ix[MAXRANK], *rr;
+          int nix, ii;
+          nix = parse_index_list(p, ix);
+          rr = select_p(pre, ix, nix);
+          for (ii = 0; ii < nix; ii++) if (ix[ii]) a_rel(ix[ii]);
+          a_rel(pre);
+          pre = rr;
+        }
+      }
+    }
+    a = parse_operand_from(p, pre);
+  }
   if (a && p->t[p->i].k == K_NAME) {
     Fn *uo = fn_find(p->t[p->i].s);
     const PrimDef *pd;
@@ -4110,10 +4383,12 @@ static Arr *parse_expr(Ps *p)
   }
   if (dyadic_at(p, &f, &ea)) {
     if (!a) syn_error("function returned no value");
+    qdn = (ea == 3) ? p->t[p->i].s : NULL;
     p->i += f.ntok;
     f.axis = ea ? -1 : parse_axis_opt(p);
     r = need_val(parse_expr(p));
-    if (ea == 2) res = quad_svo(a, r);
+    if (ea == 3) res = quad_dya(qdn, a, r);
+    else if (ea == 2) res = quad_svo(a, r);
     else if (ea) res = quad_ea(a, r);
     else {
       if (!f.user) cur_axis = f.axis;
@@ -4195,7 +4470,7 @@ static void exec_tokens(Tok *t)
     sprintf(nf->hdr, "dop { %s }", body);
     free(body);
     var_set(t[0].s, NULL);
-    fn_install(nf);
+    fn_install_here(nf);
     return;
   }
   if (t[0].k == K_NAME && tok_sym(&t[1], "<-") && tok_sym(&t[2], "{") &&
@@ -4206,7 +4481,7 @@ static void exec_tokens(Tok *t)
     if (ex && !ex->lam) syn_error_s("name is already a function: ", t[0].s);
     nf = lambda_make(t, 3, brace_end(t, 2), t[0].s);
     var_set(t[0].s, NULL);
-    fn_install(nf);
+    fn_install_here(nf);
     return;
   }
   if (t[0].k == K_NAME && tok_sym(&t[1], "[")) {
@@ -4292,11 +4567,12 @@ static void exec_tokens(Tok *t)
 static void frame_save(Frame *fr, const char *name)
 {
   int i;
+  char *key = oo_local_key(name);
   for (i = 0; i < fr->nsaved; i++)
-    if (strcmp(fr->sv[i].name, name) == 0) return;
+    if (strcmp(fr->sv[i].key, key) == 0) { free(key); return; }
   fr->sv = (Saved *)xrealloc(fr->sv, sizeof(Saved) * (size_t)(fr->nsaved + 1));
-  fr->sv[fr->nsaved].name = name;
-  fr->sv[fr->nsaved].val = var_take(name);
+  fr->sv[fr->nsaved].key = key;
+  fr->sv[fr->nsaved].val = var_take_key(key);
   fr->nsaved++;
 }
 
@@ -4431,6 +4707,7 @@ static Fn *lambda_make(const Tok *t, int a, int b, const char *name)
   int i, st = a, d = 0, uses_alpha = 0;
   char *body = tok_src(t, a, b);
   f->name = xstrdup(name);
+  f->key = NULL; f->sc = NULL; f->mflag = 0; f->master = NULL; f->bsc = NULL;
   f->res = f->left = f->right = NULL;
   f->hdr = (char *)xmalloc(strlen(body) + 5);
   sprintf(f->hdr, "{ %s }", body);
@@ -4546,6 +4823,7 @@ static Arr *call_lambda(Fn *f, Arr *left, Arr *right)
   if (fdepth >= MAXDEPTH) rt_error("DEPTH ERROR: calls nested too deeply");
   fr = &frames[fdepth++];
   fr->fn = f; fr->nsaved = 0; fr->sv = NULL;
+  oo_enter(fr, f);
   for (i = 0; i < f->nloc; i++) frame_save(fr, f->loc[i]);
   if (left) var_set("alpha", a_ref(left));
   var_set("omega", a_ref(right));
@@ -4833,10 +5111,13 @@ static Arr *call_fn(Fn *f, Arr *left, Arr *right)
   int i, pc;
   Arr *result = NULL;
   CSt cs;
+  Fn *bound = f;
+  if (f->master) f = f->master;
   if (f->lam) return call_lambda(f, left, right);
   if (fdepth >= MAXDEPTH) rt_error("DEPTH ERROR: calls nested too deeply");
   fr = &frames[fdepth++];
   fr->fn = f; fr->nsaved = 0; fr->sv = NULL;
+  oo_enter(fr, bound);
   if (f->left) frame_save(fr, f->left);
   if (f->right) frame_save(fr, f->right);
   if (f->res) frame_save(fr, f->res);
@@ -4873,8 +5154,1032 @@ static Arr *call_fn(Fn *f, Arr *left, Arr *right)
   unwind_frames(fdepth - 1);
   return result;
 }
+/* ===== p4b_oo.c ===== */
+/* p4b_oo.c - namespaces, classes and instances (the object layer)
+ *
+ * Everything is built on the one variable table and the one function list
+ * of the evaluator.  A Scope owns a key prefix; its members are ordinary
+ * table entries whose key is prefix + name:
+ *     namespace  Util        prefix  "Util."          Util.f   Util.x
+ *     class      Account     prefix  "Account."       methods, shared fields
+ *     instance   #7          prefix  "\1I7."          instance fields
+ * Unqualified names are looked up in cur_scope (NULL = the classic root).
+ * An object reference is an enclosed character vector (the "handle") whose
+ * Arr carries a pointer to its Scope; Scopes are reference counted through
+ * those handles, and an instance whose count drops to zero is destroyed
+ * (destructors run) at the end of the statement.
+ */
+
+#define SK_ROOT 0
+#define SK_NS 1
+#define SK_CLASS 2
+#define SK_INST 3
+#define SK_IFACE 4
+
+/* method attributes (Fn.mflag) */
+#define F_PUBLIC 1
+#define F_SHARED 2
+#define F_CTOR 4
+#define F_DTOR 8
+#define F_OVER 16
+#define F_PGET 32
+#define F_PSET 64
+
+/* member kinds */
+#define M_FIELD 1
+#define M_PROP 2
+#define M_EVENT 3
+#define M_METHOD 4      /* interfaces only: a required method */
+
+typedef struct Member {
+  char *name;
+  int kind;
+  int pub, shared, ro;
+  char *init;             /* field: initial-value expression text */
+} Member;
+
+typedef struct Hdl { char *ev; char *path; int home; } Hdl;
+
+typedef struct Scope {
+  int kind, id, anon, alive, refc, dying, inq, dtored;
+  char *name, *pfx, *df;
+  struct Scope *parent;      /* namespace: enclosing namespace */
+  struct Scope *cls;         /* instance: its class */
+  struct Scope *base;        /* class: base class */
+  Member *mem; int nmem;
+  struct Scope **ifs; int nif;     /* class: implemented interfaces */
+  Hdl *hd; int nhd;                /* instance: event handlers */
+  Fn **bound; int nbound;          /* bound copies of methods */
+  char **vk; int nvk;              /* instance: keys of its variables */
+} Scope;
+
+static Scope **scopes = NULL;
+static int nscopes = 0, capscopes = 0;
+static Scope **decls = NULL;       /* namespaces, classes, interfaces */
+static int ndecls = 0;
+static int oo_restoring = 0;       /* )LOAD: access rules are suspended */
+static Scope **dq = NULL;
+static int ndq = 0, capdq = 0, oo_flushing = 0;
+static Fn dummy_fn;
+/* saved-object ids <-> scopes while a workspace is being loaded */
+static Arr **idm_ref = NULL;
+static int *idm_id = NULL;
+static int idm_n = 0;
+
+/* class-definition state (set while a :Class body is being read) */
+static Scope *def_cls = NULL;
+static int def_flags = 0;
+static char *def_prop = NULL;
+static Fn *edit_target = NULL;
+
+static void kcat(char *buf, const char *a, const char *b)
+{
+  size_t la = strlen(a), lb = strlen(b);
+  if (la + lb >= KEYMAX) rt_error("LIMIT ERROR: name too long");
+  memcpy(buf, a, la);
+  memcpy(buf + la, b, lb + 1);
+}
+
+/* ---------- scopes ---------- */
+static Scope *root_scope(void);
+static Scope *scope_new(int kind, const char *name)
+{
+  Scope *s;
+  char buf[64];
+  if (nscopes == 0 && kind != SK_ROOT) root_scope();
+  s = (Scope *)xmalloc(sizeof(Scope));
+  memset(s, 0, sizeof(Scope));
+  if (nscopes == capscopes) {
+    capscopes = capscopes ? capscopes * 2 : 64;
+    scopes = (Scope **)xrealloc(scopes, sizeof(Scope *) * (size_t)capscopes);
+  }
+  s->id = nscopes;
+  scopes[nscopes++] = s;
+  s->kind = kind;
+  s->alive = 1;
+  s->name = xstrdup(name);
+  if (kind == SK_INST) {
+    sprintf(buf, "\1I%d.", s->id);
+    s->pfx = xstrdup(buf);
+  } else if (name[0] == '\0') {
+    s->anon = 1;
+    sprintf(buf, "\1N%d.", s->id);
+    s->pfx = xstrdup(buf);
+  } else {
+    s->pfx = (char *)xmalloc(strlen(name) + 2);
+    sprintf(s->pfx, "%s.", name);
+  }
+  if (kind != SK_INST && !s->anon && s->id > 0) {
+    decls = (Scope **)xrealloc(decls, sizeof(Scope *) * (size_t)(ndecls + 1));
+    decls[ndecls++] = s;
+  }
+  return s;
+}
+
+static Scope *root_scope(void)
+{
+  if (nscopes == 0) {
+    Scope *r = scope_new(SK_ROOT, "#");
+    free(r->pfx);
+    r->pfx = xstrdup("");
+    r->kind = SK_NS;
+  }
+  return scopes[0];
+}
+
+/* a namespace / class / interface called key (full name), or NULL */
+static Scope *scope_find_decl(const char *key)
+{
+  int i;
+  for (i = 0; i < ndecls; i++) {
+    Scope *s = decls[i];
+    if (s->alive && strcmp(s->name, key) == 0) return s;
+  }
+  return NULL;
+}
+
+static Scope *scope_by_id(int id)
+{
+  if (id < 0 || id >= nscopes) return NULL;
+  return scopes[id];
+}
+
+static void scope_free(Scope *s)
+{
+  int i;
+  if (s->id > 0 && s->id < nscopes && scopes[s->id] == s) scopes[s->id] = NULL;
+  for (i = 0; i < ndecls; i++)
+    if (decls[i] == s) { decls[i] = decls[--ndecls]; break; }
+  for (i = 0; i < s->nmem; i++) { free(s->mem[i].name); free(s->mem[i].init); }
+  free(s->mem);
+  for (i = 0; i < s->nhd; i++) { free(s->hd[i].ev); free(s->hd[i].path); }
+  free(s->hd);
+  for (i = 0; i < s->nbound; i++) fn_free(s->bound[i]);
+  free(s->bound);
+  for (i = 0; i < s->nvk; i++) free(s->vk[i]);
+  free(s->vk);
+  free(s->ifs);
+  free(s->name); free(s->pfx); free(s->df);
+  free(s);
+}
+
+/* ---------- object references ---------- */
+static Arr *obj_ref(Scope *s)
+{
+  char buf[32];
+  Arr *h, *r;
+  sprintf(buf, "\1%d", s->id);
+  h = a_str(buf);
+  h->obj = s;
+  s->refc++;
+  r = a_new(T_NEST, 0, NULL);
+  r->sub[0] = h;
+  return r;
+}
+static Scope *obj_of(const Arr *a)
+{
+  if (a->obj) return a->obj;
+  if (a->type == T_NEST && a->rank == 0 && a->sub[0] && a->sub[0]->obj)
+    return a->sub[0]->obj;
+  return NULL;
+}
+static const char *obj_text(const Scope *s)
+{
+  static char buf[4][160];
+  static int k = 0;
+  char *b = buf[k = (k + 1) & 3];
+  if (s->kind == SK_INST && s->df) sprintf(b, "%.150s", s->df);
+  else if (s->kind == SK_INST) sprintf(b, "#.[%.100s]", s->cls ? s->cls->name : "?");
+  else if (s->kind == SK_CLASS) sprintf(b, "#.[Class %.100s]", s->name);
+  else if (s->kind == SK_IFACE) sprintf(b, "#.[Interface %.100s]", s->name);
+  else if (s->id == 0) strcpy(b, "#");
+  else if (s->anon) strcpy(b, "#.[Namespace]");
+  else sprintf(b, "#.%.150s", s->name);
+  return b;
+}
+
+static void dq_push(Scope *s)
+{
+  if (s->inq) return;
+  if (ndq == capdq) {
+    capdq = capdq ? capdq * 2 : 16;
+    dq = (Scope **)realloc(dq, sizeof(Scope *) * (size_t)capdq);
+    if (!dq) { capdq = 0; ndq = 0; return; }
+  }
+  s->inq = 1;
+  dq[ndq++] = s;
+}
+static void obj_release(Scope *s)
+{
+  if (--s->refc > 0) return;
+  s->refc = 0;
+  if (!s->alive) {
+    /* an expunged class/namespace nobody refers to any more */
+    if (!s->inq) scope_free(s);
+    return;
+  }
+  if ((s->kind == SK_INST || s->anon) && !s->dying) dq_push(s);
+}
+
+/* a variable was created under an instance prefix: remember its key */
+static void oo_note_var(const char *key)
+{
+  int id = 0;
+  const char *p = key + 2;
+  Scope *s;
+  while (is_digit((unsigned char)*p)) { id = id * 10 + (*p - '0'); p++; }
+  s = scope_by_id(id);
+  if (!s || !s->alive) return;
+  s->vk = (char **)xrealloc(s->vk, sizeof(char *) * (size_t)(s->nvk + 1));
+  s->vk[s->nvk++] = xstrdup(key);
+}
+
+/* remove a variable entry altogether */
+static void var_drop(const char *key)
+{
+  unsigned h = hashname(key);
+  Var **pp = &vtab[h], *v;
+  while ((v = *pp) != NULL) {
+    if (strcmp(v->name, key) == 0) {
+      *pp = v->next;
+      if (v->ap) { int id = v->ap; v->ap = 0; ap_do_retract(id, v->name); }
+      a_rel(v->val);
+      free(v->name);
+      free(v);
+      return;
+    }
+    pp = &v->next;
+  }
+}
+
+/* ---------- member lookup ---------- */
+static Member *cls_member(Scope *c, const char *m)
+{
+  int i;
+  for (i = 0; i < c->nmem; i++)
+    if (strcmp(c->mem[i].name, m) == 0) return &c->mem[i];
+  return NULL;
+}
+static Member *chain_member(Scope *c, const char *m, Scope **decl)
+{
+  for (; c; c = c->base) {
+    Member *mm = cls_member(c, m);
+    if (mm) { *decl = c; return mm; }
+  }
+  return NULL;
+}
+static Fn *chain_method(Scope *c, const char *m, Scope **decl)
+{
+  char key[KEYMAX];
+  for (; c; c = c->base) {
+    Fn *f;
+    kcat(key, c->pfx, m);
+    f = fn_find_key(key);
+    if (f && f->sc == c) { *decl = c; return f; }
+  }
+  return NULL;
+}
+static int is_derived(Scope *c, Scope *b)
+{
+  for (; c; c = c->base) if (c == b) return 1;
+  return 0;
+}
+static int can_see(Scope *decl, int pub)
+{
+  return pub || oo_restoring || cur_owner == decl;
+}
+
+/* a copy of method m that runs in scope X (instance or class) */
+static Fn *bind_fn(Fn *m, Scope *X)
+{
+  Fn *c;
+  int i;
+  for (i = 0; i < X->nbound; i++)
+    if (X->bound[i]->master == m && X->bound[i]->arity == m->arity)
+      return X->bound[i];
+  c = (Fn *)xmalloc(sizeof(Fn));
+  *c = *m;
+  c->master = m;
+  c->bsc = X;
+  c->name = xstrdup(m->name);
+  c->key = xstrdup(m->key);
+  X->bound = (Fn **)xrealloc(X->bound, sizeof(Fn *) * (size_t)(X->nbound + 1));
+  X->bound[X->nbound++] = c;
+  return c;
+}
+
+static void priv_error(const char *m, const char *what)
+{
+  char buf[200];
+  sprintf(buf, "ACCESS ERROR: %.80s is %.20s", m, what);
+  rt_error(buf);
+}
+
+/* member m of a namespace (or the root) */
+static int ns_member(Scope *X, const char *m, int mode, Res *r)
+{
+  Var *v;
+  Fn *f;
+  Scope *sub;
+  kcat(r->key, X->pfx, m);
+  v = var_find(r->key, 0);
+  if (v && (v->val || v->ap || mode)) { r->kind = R_VAR; return 1; }
+  f = fn_find_key(r->key);
+  if (f) { r->kind = R_FN; r->fn = f; r->sc = X; return 1; }
+  sub = scope_find_decl(r->key);
+  if (sub) { r->kind = R_SCOPE; r->sc = sub; return 1; }
+  if (mode == 2) { r->kind = R_VAR; return 1; }
+  return 0;
+}
+
+/* member m of an instance or class X; start = first class to search */
+static int inst_member(Scope *X, Scope *start, const char *m, int mode, Res *r)
+{
+  Scope *decl = NULL, *c;
+  Member *mm;
+  Fn *fn;
+  c = start ? start : (X->kind == SK_INST ? X->cls : X);
+  mm = chain_member(c, m, &decl);
+  if (mm && mm->kind == M_FIELD) {
+    if (!can_see(decl, mm->pub)) priv_error(m, "private");
+    if (mode && mm->ro && !oo_restoring && cur_owner != decl)
+      priv_error(m, "read-only");
+    if (mm->shared) kcat(r->key, decl->pfx, m);
+    else {
+      if (X->kind != SK_INST) rt_error_s("DOMAIN ERROR: ", m, " is an instance field");
+      kcat(r->key, X->pfx, m);
+    }
+    r->kind = R_VAR; r->mem = mm; r->decl = decl;
+    return 1;
+  }
+  if (mm && mm->kind == M_PROP) {
+    if (!can_see(decl, mm->pub)) priv_error(m, "private");
+    r->kind = R_PROP; r->sc = X; r->mem = mm; r->decl = decl;
+    return 1;
+  }
+  fn = chain_method(c, m, &decl);
+  if (fn) {
+    int vis = (fn->mflag & F_PUBLIC) || oo_restoring || cur_owner == decl ||
+              ((fn->mflag & (F_CTOR | F_DTOR)) && cur_owner &&
+               is_derived(cur_owner, decl));
+    if (!vis) priv_error(m, "private");
+    if (X->kind == SK_CLASS && !(fn->mflag & F_SHARED) && !oo_restoring)
+      rt_error_s("DOMAIN ERROR: ", m, " is an instance method");
+    r->kind = R_FN; r->fn = bind_fn(fn, X); r->decl = decl; r->sc = X;
+    return 1;
+  }
+  /* an extra variable created by assignment inside a method */
+  kcat(r->key, X->pfx, m);
+  {
+    Var *v = var_find(r->key, 0);
+    if (v && (v->val || mode)) { r->kind = R_VAR; return 1; }
+  }
+  return 0;
+}
+
+static Scope *oo_this(void)
+{
+  if (!cur_scope) return root_scope();
+  return cur_scope;
+}
+
+/* an unqualified name, looked up from the running scope outwards */
+static int oo_unq(const char *name, int mode, Res *r)
+{
+  Scope *c = cur_scope;
+  if (c) {
+    if (c->kind == SK_NS) {
+      if (ns_member(c, name, mode, r)) return 1;
+    } else {
+      if (inst_member(c, NULL, name, mode, r)) return 1;
+      if (mode == 2) {
+        kcat(r->key, c->pfx, name);
+        r->kind = R_VAR;
+        return 1;
+      }
+    }
+    if (mode) return 0;
+  }
+  return ns_member(root_scope(), name, mode, r);
+}
+
+static Arr *oo_prop_get_value(Res *r);
+
+static int oo_walk(char **seg, int nseg, Scope *X, Scope *start, int mode,
+                   Res *r)
+{
+  int i;
+  for (i = 0; i < nseg; i++) {
+    int last = (i == nseg - 1);
+    const char *m = seg[i];
+    Res t;
+    int found;
+    if (!X->alive) rt_error("VALUE ERROR: that object has been expunged");
+    if (m[0] == '[' && m[1] == ']') {
+      if (!last) rt_error("SYNTAX ERROR: system name inside a path");
+      r->kind = R_QUAD; r->sc = X;
+      strncpy(r->qname, m + 2, sizeof(r->qname) - 1);
+      r->qname[sizeof(r->qname) - 1] = '\0';
+      return 1;
+    }
+    t.kind = R_NONE; t.fn = NULL; t.sc = NULL; t.decl = NULL; t.mem = NULL;
+    t.key[0] = '\0'; t.qname[0] = '\0';
+    if (X->kind == SK_NS) found = ns_member(X, m, last ? mode : 0, &t);
+    else if (X->kind == SK_INST || X->kind == SK_CLASS)
+      found = inst_member(X, start, m, last ? mode : 0, &t);
+    else found = 0;
+    start = NULL;
+    if (!found) return 0;
+    if (last) { *r = t; return 1; }
+    if (t.kind == R_SCOPE) X = t.sc;
+    else if (t.kind == R_VAR) {
+      Var *v = var_find(t.key, 0);
+      Arr *val = v ? var_value(v) : NULL;
+      Scope *o = val ? obj_of(val) : NULL;
+      if (!o) rt_error_s("DOMAIN ERROR: ", m, " is not a namespace or object");
+      X = o;
+    } else if (t.kind == R_PROP) {
+      Arr *val = oo_prop_get_value(&t);
+      Scope *o = val ? obj_of(val) : NULL;
+      if (!o) rt_error_s("DOMAIN ERROR: ", m, " is not a namespace or object");
+      X = o;
+    } else rt_error_s("DOMAIN ERROR: ", m, " is not a namespace or object");
+  }
+  return 0;
+}
+
+static int oo_find(const char *name, int mode, Res *r)
+{
+  char buf[2 * KEYMAX];
+  char *seg[24];
+  int n = 0;
+  char *p;
+  Scope *X, *start = NULL;
+  r->kind = R_NONE; r->fn = NULL; r->sc = NULL; r->decl = NULL;
+  r->mem = NULL; r->key[0] = '\0'; r->qname[0] = '\0';
+  if (!strchr(name, '.')) return oo_unq(name, mode, r);
+  if (strlen(name) >= sizeof(buf)) rt_error("LIMIT ERROR: name too long");
+  strcpy(buf, name);
+  seg[n++] = buf;
+  for (p = buf; *p; p++)
+    if (*p == '.') {
+      if (n >= 24) rt_error("LIMIT ERROR: path too long");
+      *p = '\0';
+      seg[n++] = p + 1;
+    }
+  if (strcmp(seg[0], "[]ROOT") == 0) X = root_scope();
+  else if (strcmp(seg[0], "[]THIS") == 0) X = oo_this();
+  else if (strcmp(seg[0], "[]BASE") == 0) {
+    X = oo_this();
+    start = cur_owner ? cur_owner->base : NULL;
+    if (!start) rt_error("DOMAIN ERROR: []BASE used where there is no base class");
+  } else if (strcmp(seg[0], "[]PARENT") == 0) {
+    X = (cur_scope && cur_scope->parent) ? cur_scope->parent : root_scope();
+  } else {
+    Res t;
+    if (!oo_unq(seg[0], 0, &t)) return 0;
+    if (t.kind == R_SCOPE) X = t.sc;
+    else if (t.kind == R_VAR) {
+      Var *v = var_find(t.key, 0);
+      Arr *val = v ? var_value(v) : NULL;
+      Scope *o = val ? obj_of(val) : NULL;
+      if (!o) rt_error_s("DOMAIN ERROR: ", seg[0], " is not a namespace or object");
+      X = o;
+    } else return 0;
+  }
+  return oo_walk(seg + 1, n - 1, X, start, mode, r);
+}
+
+static Fn *oo_fn(const char *name)
+{
+  Res r;
+  if (!oo_find(name, 0, &r)) return NULL;
+  return r.kind == R_FN ? r.fn : NULL;
+}
+
+/* absolute key under which a function-local name lives */
+static char *oo_local_key(const char *name)
+{
+  char key[KEYMAX];
+  if (!cur_scope) return xstrdup(name);
+  kcat(key, cur_scope->pfx, name);
+  return xstrdup(key);
+}
+
+/* absolute key of the function a (possibly dotted) name denotes */
+static char *oo_fn_key(const char *name)
+{
+  Res r;
+  if (strchr(name, '.') && oo_find(name, 0, &r) && r.kind == R_FN) {
+    Fn *m = r.fn->master ? r.fn->master : r.fn;
+    return xstrdup(m->key);
+  }
+  return oo_local_key(name);
+}
+
+/* ---------- scope switching ---------- */
+static void oo_enter(Frame *fr, Fn *bound)
+{
+  Fn *m = bound->master ? bound->master : bound;
+  Scope *nsc, *own;
+  fr->ssc = cur_scope;
+  fr->sow = cur_owner;
+  if (m->lam && !m->key) return;          /* anonymous lambda: inherit */
+  nsc = bound->master ? bound->bsc : m->sc;
+  own = (m->sc && m->sc->kind == SK_CLASS) ? m->sc : NULL;
+  cur_scope = (nsc && nsc->id == 0) ? NULL : nsc;
+  cur_owner = own;
+}
+
+static void scope_push(Scope *sc, Scope *own)
+{
+  Frame *fr;
+  if (fdepth >= MAXDEPTH) rt_error("DEPTH ERROR: calls nested too deeply");
+  fr = &frames[fdepth++];
+  fr->fn = &dummy_fn; fr->nsaved = 0; fr->sv = NULL;
+  fr->ssc = cur_scope; fr->sow = cur_owner;
+  cur_scope = (sc && sc->id == 0) ? NULL : sc;
+  cur_owner = own;
+}
+static void scope_pop(void)
+{
+  unwind_frames(fdepth - 1);
+}
+
+/* install a function defined by the editor / )LOAD / []FX in the right
+ * place: root, current namespace, or the class being defined */
+static void fn_install_here(Fn *f)
+{
+  char key[KEYMAX];
+  if (edit_target) {
+    Fn *t = edit_target->master ? edit_target->master : edit_target;
+    edit_target = NULL;
+    f->sc = t->sc;
+    f->mflag = t->mflag;
+    f->key = xstrdup(t->key);
+    fn_install(f);
+    return;
+  }
+  if (def_cls) {
+    f->sc = def_cls;
+    if (def_prop) {
+      int get = (strcmp(f->name, "get") == 0 || strcmp(f->name, "GET") == 0 ||
+                 strcmp(f->name, "Get") == 0);
+      int set = (strcmp(f->name, "set") == 0 || strcmp(f->name, "SET") == 0 ||
+                 strcmp(f->name, "Set") == 0);
+      char tail[16];
+      if (!get && !set) {
+        printf("apl: inside :Property only functions named get and set "
+               "are allowed\n");
+        fn_free(f);
+        return;
+      }
+      if (get && !(f->arity == 0 && f->res)) {
+        printf("apl: a property get function takes no argument and "
+               "returns a result:  R<-get\n");
+        fn_free(f);
+        return;
+      }
+      if (set && !(f->arity == 1 && !f->res)) {
+        printf("apl: a property set function takes the new value and "
+               "returns nothing:  set V\n");
+        fn_free(f);
+        return;
+      }
+      strcpy(tail, get ? ":get" : ":set");
+      kcat(key, def_cls->pfx, def_prop);
+      if (strlen(key) + 5 >= KEYMAX) { fn_free(f); return; }
+      strcat(key, tail);
+      f->mflag = get ? F_PGET : F_PSET;
+    } else {
+      f->mflag = def_flags;
+      if ((def_flags & F_CTOR) && f->arity > 1) {
+        printf("apl: a constructor takes no argument or one argument\n");
+        fn_free(f);
+        def_flags = 0;
+        return;
+      }
+      if ((def_flags & F_DTOR) && f->arity != 0) {
+        printf("apl: a destructor takes no argument\n");
+        fn_free(f);
+        def_flags = 0;
+        return;
+      }
+      kcat(key, def_cls->pfx, f->name);
+    }
+    def_flags = 0;
+    f->key = xstrdup(key);
+    fn_install(f);
+    return;
+  }
+  if (cur_scope && cur_scope->kind == SK_NS) {
+    f->sc = cur_scope;
+    kcat(key, cur_scope->pfx, f->name);
+    f->key = xstrdup(key);
+    fn_install(f);
+    return;
+  }
+  if (cur_scope) {
+    printf("apl: functions cannot be defined inside an instance or class "
+           "scope\n");
+    fn_free(f);
+    return;
+  }
+  f->key = xstrdup(f->name);
+  fn_install(f);
+}
+
+/* ---------- properties ---------- */
+static Arr *oo_prop_get_value(Res *r)
+{
+  char key[KEYMAX];
+  Fn *g;
+  Arr *v;
+  kcat(key, r->decl->pfx, r->mem->name);
+  if (strlen(key) + 5 >= KEYMAX) rt_error("LIMIT ERROR: name too long");
+  strcat(key, ":get");
+  g = fn_find_key(key);
+  if (!g) rt_error_s("DOMAIN ERROR: property ", r->mem->name, " is write-only");
+  v = call_fn(bind_fn(g, r->sc), NULL, NULL);
+  if (!v) rt_error("VALUE ERROR: property getter returned no value");
+  a_rel(prop_tmp);
+  prop_tmp = v;
+  return prop_tmp;
+}
+static Arr *oo_prop_read(Res *r)
+{
+  return oo_prop_get_value(r);
+}
+static void oo_prop_write(Res *r, Arr *a)
+{
+  char key[KEYMAX];
+  Fn *s;
+  Arr *res;
+  kcat(key, r->decl->pfx, r->mem->name);
+  if (strlen(key) + 5 >= KEYMAX) { a_rel(a); rt_error("LIMIT ERROR: name too long"); }
+  strcat(key, ":set");
+  s = fn_find_key(key);
+  if (!s) { a_rel(a); rt_error_s("READONLY ERROR: property ", r->mem->name, " has no set function"); }
+  res = call_fn(bind_fn(s, r->sc), NULL, a);
+  a_rel(a);
+  if (res) a_rel(res);
+}
+
+/* ---------- instances ---------- */
+static Fn *find_ctor(Scope *cls, int arity, int *any)
+{
+  Scope *c;
+  int i;
+  *any = 0;
+  for (c = cls; c; c = c->base)
+    for (i = 0; i < nfns; i++)
+      if (fns[i]->sc == c && (fns[i]->mflag & F_CTOR)) {
+        *any = 1;
+        if (fns[i]->arity == arity) return fns[i];
+      }
+  return NULL;
+}
+
+static Arr *oo_new(Scope *cls, Arr *args)
+{
+  Scope *inst, *chain[40], *c;
+  Arr *ref, *res;
+  int nch = 0, i, j, any;
+  Fn *ctor;
+  if (!cls || cls->kind != SK_CLASS) rt_error("DOMAIN ERROR: []NEW needs a class");
+  if (!cls->alive) rt_error("VALUE ERROR: that class has been expunged");
+  inst = scope_new(SK_INST, cls->name);
+  inst->cls = cls;
+  ref = obj_ref(inst);
+  for (c = cls; c && nch < 40; c = c->base) chain[nch++] = c;
+  for (i = nch - 1; i >= 0; i--) {
+    c = chain[i];
+    for (j = 0; j < c->nmem; j++) {
+      Member *m = &c->mem[j];
+      if (m->kind == M_FIELD && !m->shared && m->init) {
+        Arr *v;
+        scope_push(inst, c);
+        v = eval_text(m->init);
+        if (!v) rt_error_s("SYNTAX ERROR: no value for field ", m->name, "");
+        var_set(m->name, v);
+        scope_pop();
+      }
+    }
+  }
+  ctor = find_ctor(cls, args ? 1 : 0, &any);
+  if (!ctor && (args || any)) {
+    if (args) rt_error_s("DOMAIN ERROR: class ", cls->name, " has no constructor taking an argument");
+    rt_error_s("DOMAIN ERROR: class ", cls->name, " needs an argument to be created");
+  }
+  if (ctor) {
+    res = call_fn(bind_fn(ctor, inst), NULL, args);
+    if (res) a_rel(res);
+  }
+  return ref;
+}
+
+static void run_dtors(Scope *s)
+{
+  Scope *c;
+  int i;
+  if (s->dtored) return;
+  s->dtored = 1;
+  for (c = s->cls; c; c = c->base)
+    for (i = 0; i < nfns; i++)
+      if (fns[i]->sc == c && (fns[i]->mflag & F_DTOR)) {
+        Arr *r = call_fn(bind_fn(fns[i], s), NULL, NULL);
+        if (r) a_rel(r);
+      }
+}
+
+static void scope_destroy(Scope *s)
+{
+  int i;
+  for (i = 0; i < s->nvk; i++) var_drop(s->vk[i]);
+  s->alive = 0;
+  scope_free(s);
+}
+
+/* end-of-statement: destroy instances nobody refers to any more */
+static void oo_flush(void)
+{
+  if (oo_flushing) return;
+  oo_flushing = 1;
+  while (ndq > 0) {
+    Scope *s = dq[--ndq];
+    s->inq = 0;
+    if (!s->alive) { if (s->refc <= 0) scope_free(s); continue; }
+    if (s->refc > 0) continue;
+    s->dying = 1;
+    if (s->kind == SK_INST) run_dtors(s);
+    if (s->refc > 0) { s->dying = 0; continue; }    /* resurrected */
+    scope_destroy(s);
+  }
+  oo_flushing = 0;
+}
+
+/* run every destructor (workspace clear / end of session) */
+static void oo_destroy_all(void)
+{
+  int i;
+  for (i = 1; i < nscopes; i++) {
+    Scope *s = scopes[i];
+    if (s && s->alive && s->kind == SK_INST && !s->dying) {
+      s->dying = 1;
+      run_dtors(s);
+    }
+  }
+}
+
+static int oo_count_instances(Scope *cls)
+{
+  int i, n = 0;
+  for (i = 1; i < nscopes; i++) {
+    Scope *s = scopes[i];
+    if (s && s->alive && s->kind == SK_INST && is_derived(s->cls, cls)) n++;
+  }
+  return n;
+}
+
+/* ---------- events ---------- */
+static void oo_on(Scope *obj, const char *ev, const char *path)
+{
+  Scope *c;
+  int ok = 0;
+  Hdl *h;
+  for (c = obj->cls; c; c = c->base) {
+    Member *m = cls_member(c, ev);
+    if (m && m->kind == M_EVENT) { ok = 1; break; }
+  }
+  if (!ok) rt_error_s("DOMAIN ERROR: no such event: ", ev, "");
+  obj->hd = (Hdl *)xrealloc(obj->hd, sizeof(Hdl) * (size_t)(obj->nhd + 1));
+  h = &obj->hd[obj->nhd++];
+  h->ev = xstrdup(ev);
+  h->path = xstrdup(path);
+  h->home = cur_scope ? cur_scope->id : 0;
+}
+
+static void oo_raise(Scope *obj, const char *ev, Arr *data)
+{
+  int i, ok = 0, n;
+  Scope *c;
+  for (c = obj->cls; c; c = c->base) {
+    Member *m = cls_member(c, ev);
+    if (m && m->kind == M_EVENT) { ok = 1; break; }
+  }
+  if (!ok) rt_error_s("DOMAIN ERROR: no such event: ", ev, "");
+  n = obj->nhd;
+  for (i = 0; i < n && i < obj->nhd; i++) {
+    Hdl h = obj->hd[i];
+    Scope *home;
+    Fn *f;
+    Arr *res, *arg;
+    if (strcmp(h.ev, ev) != 0) continue;
+    home = scope_by_id(h.home);
+    if (!home || !home->alive) continue;
+    scope_push(home, home->kind == SK_INST ? home->cls : NULL);
+    f = fn_find(h.path);
+    if (!f) { scope_pop(); rt_error_s("VALUE ERROR: event handler not found: ", h.path, ""); }
+    arg = data ? a_ref(data) : a_vec(T_NUM, 0);
+    res = call_fn(f, NULL, f->arity >= 1 ? arg : NULL);
+    a_rel(arg);
+    if (res) a_rel(res);
+    scope_pop();
+  }
+}
+
+/* name of key relative to the current scope, or NULL if it belongs elsewhere */
+static const char *oo_rel(const char *key)
+{
+  const char *rest;
+  if (cur_scope) {
+    size_t pl = strlen(cur_scope->pfx);
+    if (strncmp(key, cur_scope->pfx, pl) != 0) return NULL;
+    rest = key + pl;
+  } else {
+    if (key[0] == '\1') return NULL;
+    rest = key;
+  }
+  return strchr(rest, '.') ? NULL : rest;
+}
+
+/* ---------- names as values ---------- */
+static Arr *oo_name_value(const char *name)
+{
+  Res r;
+  if (!cur_scope && !strchr(name, '.')) {
+    Scope *s = scope_find_decl(name);
+    return s ? obj_ref(s) : NULL;
+  }
+  if (!oo_find(name, 0, &r)) return NULL;
+  if (r.kind == R_SCOPE) return obj_ref(r.sc);
+  return NULL;
+}
+
+static Arr *oo_quad_value(const char *name)
+{
+  if (strcmp(name, "THIS") == 0) return obj_ref(oo_this());
+  if (strcmp(name, "ROOT") == 0) return obj_ref(root_scope());
+  if (strcmp(name, "PARENT") == 0)
+    return obj_ref((cur_scope && cur_scope->parent) ? cur_scope->parent
+                                                    : root_scope());
+  if (strcmp(name, "CS") == 0) return obj_ref(cur_scope ? cur_scope : root_scope());
+  return NULL;
+}
+
+/* ---------- is-a ---------- */
+static int class_isa(Scope *c, Scope *t)
+{
+  for (; c; c = c->base) {
+    int i;
+    if (c == t) return 1;
+    for (i = 0; i < c->nif; i++) if (c->ifs[i] == t) return 1;
+  }
+  return 0;
+}
+
+
+
+/* ---------- objects as auxiliary processors ---------- */
+/* An object that has public methods  Offer Get Set Retract  can stand in
+ * for a processor:  Offer N / R<-Get N / R<-N Set V / Retract N  */
+static Fn *ap_method(const ApProc *p, const char *m, Scope **sc)
+{
+  Scope *s = scope_by_id(p->objid), *d;
+  Fn *f;
+  if (!s || !s->alive)
+    rt_error("DOMAIN ERROR: the object serving as processor no longer exists");
+  *sc = s;
+  f = chain_method(s->cls, m, &d);
+  if (f && !(f->mflag & F_PUBLIC)) f = NULL;
+  return f;
+}
+static void obj_ap_offer(const ApProc *p, const char *var)
+{
+  Scope *s;
+  Fn *f = ap_method(p, "Offer", &s);
+  Arr *n, *r;
+  if (!f) return;
+  n = a_str(var);
+  r = call_fn(bind_fn(f, s), NULL, n);
+  a_rel(n);
+  if (r) a_rel(r);
+}
+static Arr *obj_ap_get(const ApProc *p, const char *var)
+{
+  Scope *s;
+  Fn *f = ap_method(p, "Get", &s);
+  Arr *n, *r;
+  if (!f) return NULL;
+  n = a_str(var);
+  r = call_fn(bind_fn(f, s), NULL, n);
+  a_rel(n);
+  return r;
+}
+static Arr *obj_ap_set(const ApProc *p, const char *var, Arr *val)
+{
+  Scope *s;
+  Fn *f = ap_method(p, "Set", &s);
+  Arr *n, *r;
+  if (!f) return NULL;
+  n = a_str(var);
+  r = call_fn(bind_fn(f, s), n, val);
+  a_rel(n);
+  return r;
+}
+static void obj_ap_retract(const ApProc *p, const char *var)
+{
+  Scope *s;
+  Fn *f = ap_method(p, "Retract", &s);
+  Arr *n, *r;
+  if (!f) return;
+  n = a_str(var);
+  r = call_fn(bind_fn(f, s), NULL, n);
+  a_rel(n);
+  if (r) a_rel(r);
+}
+
+/* the processor number for object s (registering it when new) */
+static int ap_for_object(Scope *s, int id)
+{
+  int i;
+  if (!s || s->kind != SK_INST) rt_error("DOMAIN ERROR: a processor must be an instance of a class");
+  for (i = 0; i < ap_n; i++)
+    if (ap_tab[i].objid == s->id && (id == 0 || ap_tab[i].id == id))
+      return ap_tab[i].id;
+  if (id == 0) {
+    id = 1000;
+    while (ap_find(id)) id++;
+  } else if (ap_find(id)) rt_error("DOMAIN ERROR: that processor number is already in use");
+  if (ap_n >= AP_MAXPROC) rt_error("WS FULL: too many processors");
+  ap_register(id, "OBJECT", 1, NULL, NULL, NULL, NULL);
+  ap_tab[ap_n - 1].objid = s->id;
+  ap_tab[ap_n - 1].oref = obj_ref(s);
+  return id;
+}
+
+/* mark roots owned by this layer */
+static void oo_mark_roots(void)
+{
+  int i;
+  if (prop_tmp) mark_arr(prop_tmp);
+  for (i = 0; i < ap_n; i++) if (ap_tab[i].oref) mark_arr(ap_tab[i].oref);
+  for (i = 0; i < idm_n; i++) mark_arr(idm_ref[i]);
+}
+
+/* member `path` of the object value obj (for  (expr).member ) */
+static int oo_member_of(Arr *obj, const char *path, Res *r)
+{
+  char buf[2 * KEYMAX];
+  char *seg[24], *q;
+  int n = 0;
+  Scope *X = obj_of(obj);
+  r->kind = R_NONE; r->fn = NULL; r->sc = NULL; r->decl = NULL;
+  r->mem = NULL; r->key[0] = '\0'; r->qname[0] = '\0';
+  if (!X) rt_error("DOMAIN ERROR: a member can only be selected from a namespace or object");
+  if (strlen(path) >= sizeof(buf)) rt_error("LIMIT ERROR: name too long");
+  strcpy(buf, path);
+  seg[n++] = buf;
+  for (q = buf; *q; q++)
+    if (*q == '.') {
+      if (n >= 24) rt_error("LIMIT ERROR: path too long");
+      *q = '\0';
+      seg[n++] = q + 1;
+    }
+  return oo_walk(seg, n, X, NULL, 0, r);
+}
 /* ===== p5_sys.c ===== */
 /* p5_sys.c - function editor, system commands, workspaces, REPL, main */
+
+/* object layer (p4b_oo.c, p5b_oosys.c) */
+static int oo_quad_is_fn(const char *name);
+static int oo_quad_fn(const char *name, Arr *x, Arr **out);
+static int oo_is_block(const char *first);
+static int oo_block(FILE *fp, const char *line, int mode);
+static int guarded(void (*fn)(void *), void *arg);
+static double oo_nc(const char *nm);
+static int oo_ex(const char *nm);
+static void oo_clear_all(void);
+static void oo_clear_finish(void);
+static void oo_flush(void);
+static void oo_destroy_all(void);
+static void oo_mark_roots(void);
+static void emit_ref(FILE *fp, struct Scope *s);
+static void emit_fn(FILE *fp, const Fn *f);
+static void oo_save_defs(FILE *fp, int *ncls, int *nns);
+static void oo_save_instances(FILE *fp, int *ninst);
+static void oo_save_values(FILE *fp);
+static void oo_save_procs(FILE *fp, int *nshare);
+static void oo_load_begin(void);
+static void oo_load_end(void);
+static void sys_cs(const char *arg);
+static void sys_classes(void);
+static void sys_nss(void);
+static void sys_ifaces(void);
+static const char *oo_rel(const char *key);
+static Fn *ed_lookup(const char *name);
+static int run_stream_until(FILE *fp, int mode, const char *endword);
+static void guarded_flush_(void);
 
 /* ---------- small string helpers ---------- */
 static char *trim_dup(const char *s)
@@ -5025,7 +6330,7 @@ static int header_parse(const char *text, HInfo *h)
            h->name);
     return 0;
   }
-  if (var_get(h->name)) {
+  if (!def_cls && var_get(h->name)) {
     printf("apl: %s is already a variable; clear it first, or pick another"
            " name\n", h->name);
     return 0;
@@ -5134,6 +6439,7 @@ static void fn_commit(const HInfo *h, ELine *el, int nel)
   char buf[512];
   int i;
   f->name = xstrdup(h->name);
+  f->key = NULL; f->sc = NULL; f->mflag = 0; f->master = NULL; f->bsc = NULL;
   f->arity = h->arity;
   f->res = h->res[0] ? xstrdup(h->res) : NULL;
   f->left = h->left[0] ? xstrdup(h->left) : NULL;
@@ -5156,7 +6462,23 @@ static void fn_commit(const HInfo *h, ELine *el, int nel)
     f->tk[i] = NULL;
     f->label[i] = label_of(f->lines[i]);
   }
-  fn_install(f);
+  fn_install_here(f);
+}
+
+/* the function a nabla command names: inside a :Class body the methods of
+ * that class, otherwise whatever the (possibly dotted) name denotes */
+static Fn *ed_lookup(const char *name)
+{
+  Fn *f;
+  if (def_cls) {
+    char key[KEYMAX];
+    kcat(key, def_cls->pfx, name);
+    return fn_find_key(key);
+  }
+  oo_restoring++;
+  f = fn_find(name);
+  oo_restoring--;
+  return f;
 }
 
 /* the editor. rest = text after "nabla"; fp supplies further lines */
@@ -5184,14 +6506,18 @@ static void enter_editor(const char *rest, FILE *fp)
     n += next_word(&s, w1, 64);
     n += next_word(&s, w2, 64);
     n += next_word(&s, w3, 64);
-    if (n == 2 && (ieq(w2, "nabla") || ieq(w2, "edit")) && fn_find(w1)) {
-      fn_show(fn_find(w1));
+    if (n == 2 && (ieq(w2, "nabla") || ieq(w2, "edit")) && ed_lookup(w1)) {
+      fn_show(ed_lookup(w1));
       free(ht);
       return;
     }
-    if (n == 1 && fn_find(w1)) existing = fn_find(w1);
+    if (n == 1 && ed_lookup(w1)) {
+      existing = ed_lookup(w1);
+      edit_target = existing;
+    }
     if (existing && existing->lam) {
       printf("%s is a lambda; redefine it with: %s <- { ... }\n", w1, w1);
+      edit_target = NULL;
       free(ht);
       return;
     }
@@ -5337,7 +6663,8 @@ static int quad_is_fn(const char *name)
          strcmp(name, "CR") == 0 || strcmp(name, "FX") == 0 ||
          strcmp(name, "SIGNAL") == 0 || strcmp(name, "DL") == 0 ||
          strcmp(name, "VFI") == 0 || strcmp(name, "SVO") == 0 ||
-         strcmp(name, "SVR") == 0 || strcmp(name, "SVQ") == 0;
+         strcmp(name, "SVR") == 0 || strcmp(name, "SVQ") == 0 ||
+         oo_quad_is_fn(name);
 }
 
 /* row i of a text vector/matrix (blank-trimmed), as a new C string */
@@ -5402,9 +6729,12 @@ static Arr *quad_svo(Arr *proc, Arr *names)
 {
   int nrows, i, id;
   Arr *r;
-  need_num(proc, P_INDEX);
-  if (proc->n != 1) rt_error("RANK ERROR: []SVO needs one processor number on the left");
-  id = as_int(proc->num[0], P_INDEX);
+  if (obj_of(proc)) id = ap_for_object(obj_of(proc), 0);
+  else {
+    need_num(proc, P_INDEX);
+    if (proc->n != 1) rt_error("RANK ERROR: []SVO needs one processor number on the left");
+    id = as_int(proc->num[0], P_INDEX);
+  }
   nrows = text_rows(names);
   r = a_vec(T_NUM, nrows);
   for (i = 0; i < nrows; i++) {
@@ -5427,6 +6757,10 @@ static Arr *quad_svo(Arr *proc, Arr *names)
 static Arr *quad_fn(const char *name, Arr *x)
 {
   int nrows, i;
+  {
+    Arr *o;
+    if (oo_quad_fn(name, x, &o)) return o;
+  }
   if (strcmp(name, "SVO") == 0 || strcmp(name, "SVR") == 0) {
     Arr *r;
     int retract = (name[2] == 'R');
@@ -5547,7 +6881,7 @@ static Arr *quad_fn(const char *name, Arr *x)
     nrows = text_rows(x);
     if (nrows != 1) rt_error("RANK ERROR: []CR takes one name");
     nm = text_row(x, 0, 1);
-    f = fn_find(nm);
+    f = ed_lookup(nm);
     free(nm);
     if (!f) return a_vec(T_CHR, 0);
     if (f->lam) {
@@ -5575,16 +6909,17 @@ static Arr *quad_fn(const char *name, Arr *x)
     r = a_vec(T_NUM, nrows);
     for (i = 0; i < nrows; i++) {
       char *nm = text_row(x, i, nrows);
-      int cls = 0;
+      double cls = 0;
+      trk_add(nm, 0);
       if (strcmp(name, "NC") == 0) {
-        if (fn_find(nm)) cls = 3;
-        else if (var_get(nm)) cls = 2;
-        else cls = 0;
+        cls = oo_nc(nm);
       } else {
-        if (fn_find(nm)) cls = fn_remove(nm);
+        if (fn_find(nm)) cls = (double)fn_remove(nm);
         else if (var_get(nm)) { var_set(nm, NULL); cls = 1; }
+        else cls = (double)oo_ex(nm);
       }
-      r->num[i] = (double)cls;
+      r->num[i] = cls;
+      trk_del(nm);
       free(nm);
     }
     if (nrows == 1) {
@@ -5604,27 +6939,43 @@ static void mark_roots(void)
   for (i = 0; i < HSIZE; i++)
     for (v = vtab[i]; v; v = v->next)
       if (v->val) mark_arr(v->val);
+  oo_mark_roots();
 }
 
-/* run one statement; returns 0 on success, 1 on error (message printed) */
+/* run one statement; returns 0 on success, 1 on error (message printed).
+ * Statements may nest (a block body, []FIX), so each uses the next catch
+ * slot and only the outermost one sweeps unreachable arrays. */
 static int run_stmt(const char *ln)
 {
-  catch_top = 0;
-  sstop = 0;
-  if (setjmp(catch_jb[0]) == 0) {
+  volatile int base = catch_top + 1;
+  volatile int fd = fdepth, tm = ntrk;
+  if (base >= MAXCATCH) { printf("apl: statements nested too deeply\n"); return 1; }
+  catch_top = base;
+  if (base == 0) sstop = 0;
+  if (setjmp(catch_jb[base]) == 0) {
     Tok *t = lex_t(ln);
     exec_tokens(t);
     lex_free(t);
+    oo_flush();
+    catch_top = base - 1;
     return 0;
   }
-  catch_top = 0;
-  trk_unwind(0);
-  unwind_frames(0);
+  catch_top = base;
+  trk_unwind(tm);
+  unwind_frames(fd);
   br_set = 0;
+  oo_flushing = 0;
   printf("apl: %s error -- %s\n", errkind, errmsg);
   fflush(stdout);
-  mark_roots();
-  sweep_unmarked();
+  if (base == 0 && fd == 0) {
+    mark_roots();
+    sweep_unmarked();
+  }
+  catch_top = base - 1;
+  if (base == 0) {
+    /* destroy what the failed statement left unreachable */
+    guarded_flush_();
+  }
   return 1;
 }
 
@@ -5731,6 +7082,11 @@ static void emit_simple(FILE *fp, const Arr *a)
 static void emit_expr(FILE *fp, const Arr *a)
 {
   int i;
+  if (a->obj) { emit_ref(fp, a->obj); return; }
+  if (a->type == T_NEST && a->rank == 0 && a->sub[0] && a->sub[0]->obj) {
+    emit_ref(fp, a->sub[0]->obj);
+    return;
+  }
   if (a->type != T_NEST) { emit_simple(fp, a); return; }
   if (a->rank == 0) {
     fprintf(fp, "enclose (");
@@ -5807,7 +7163,7 @@ static void save_value(FILE *fp, const char *name, const Arr *a)
 static void sys_save(const char *arg)
 {
   char *name = trim_dup(arg), *fn;
-  int nv = 0, nf = 0, i, nn = 0;
+  int nv = 0, nf = 0, i, nn = 0, ncls = 0, nns = 0, ninst = 0, nshare = 0;
   Var *v;
   char **names = NULL;
   FILE *fp;
@@ -5819,16 +7175,16 @@ static void sys_save(const char *arg)
   }
   for (i = 0; i < HSIZE; i++)
     for (v = vtab[i]; v; v = v->next)
-      if (v->val) {
+      if (v->val && !strchr(v->name, '.') && v->name[0] != '\1') {
         names = (char **)xrealloc(names, sizeof(char *) * (size_t)(nn + 1));
         names[nn++] = v->name;
       }
-  if (nn == 0 && nfns == 0) {
+  if (nn == 0 && nfns == 0 && ndecls == 0 && nscopes <= 1) {
     printf("(nothing to save)\n");
     free(name); free(names);
     return;
   }
-  qsort(names, (size_t)nn, sizeof(char *), cmp_str);
+  if (nn > 1) qsort(names, (size_t)nn, sizeof(char *), cmp_str);
   fn = ws_file_name(name);
   fp = fopen(fn, "w");
   if (!fp) {
@@ -5837,22 +7193,18 @@ static void sys_save(const char *arg)
     return;
   }
   fprintf(fp, "# saved by )SAVE\n");
-  for (i = 0; i < nn; i++) { save_value(fp, names[i], var_get(names[i])); nv++; }
-  for (i = 0; i < nfns; i++) {
-    int j;
-    if (fns[i]->lam) {
-      fprintf(fp, "%s <- %s\n", fns[i]->name, fns[i]->hdr);
-      nf++;
-      continue;
-    }
-    fprintf(fp, "nabla %s\n", fns[i]->hdr);
-    for (j = 1; j <= fns[i]->nlines; j++) fprintf(fp, "%s\n", fns[i]->lines[j]);
-    fprintf(fp, "nabla\n");
-    nf++;
-  }
+  for (i = 0; i < nfns; i++)
+    if (!fns[i]->sc) { emit_fn(fp, fns[i]); nf++; }
+  oo_save_defs(fp, &ncls, &nns);
+  oo_save_instances(fp, &ninst);
+  for (i = 0; i < nn; i++) { save_value(fp, names[i], var_find(names[i], 0)->val); nv++; }
+  oo_save_values(fp);
+  oo_save_procs(fp, &nshare);
   fclose(fp);
   { char *b = ws_base_name(fn); strncpy(wsid, b, sizeof(wsid) - 1); free(b); }
   printf("saved %d variable(s) and %d function(s) to %s\n", nv, nf, fn);
+  if (ncls || nns || ninst)
+    printf("  also %d class(es), %d namespace(s), %d object(s)\n", ncls, nns, ninst);
   free(name); free(fn); free(names);
 }
 
@@ -5874,7 +7226,9 @@ static void sys_load(const char *arg)
     free(name); free(fn);
     return;
   }
+  oo_load_begin();
   run_stream(fp, 1);
+  oo_load_end();
   fclose(fp);
   { char *b = ws_base_name(fn); strncpy(wsid, b, sizeof(wsid) - 1); free(b); }
   printf("loaded %s\n", fn);
@@ -5885,12 +7239,14 @@ static void sys_clear(void)
 {
   int i;
   Var *v;
-  while (nfns > 0) fn_remove(fns[0]->name);
+  oo_clear_all();
+  while (nfns > 0) fn_remove_key(fns[0]->key);
   for (i = 0; i < HSIZE; i++)
     for (v = vtab[i]; v; v = v->next) {
       if (v->ap) { int id = v->ap; v->ap = 0; ap_do_retract(id, v->name); }
       a_rel(v->val); v->val = NULL;
     }
+  oo_clear_finish();
   Q_IO = 1;
   Q_PP = 6;
   strcpy(wsid, "CLEAR WS");
@@ -5904,9 +7260,9 @@ static void sys_vars(void)
   Var *v;
   for (i = 0; i < HSIZE; i++)
     for (v = vtab[i]; v; v = v->next)
-      if (v->val) {
+      if (v->val && oo_rel(v->name)) {
         names = (char **)xrealloc(names, sizeof(char *) * (size_t)(n + 1));
-        names[n++] = v->name;
+        names[n++] = (char *)oo_rel(v->name);
       }
   if (n == 0) { printf("(no variables defined)\n"); free(names); return; }
   qsort(names, (size_t)n, sizeof(char *), cmp_str);
@@ -5917,16 +7273,16 @@ static void sys_vars(void)
 
 static void sys_fns(void)
 {
-  int i;
-  if (nfns == 0) {
-    printf("(no user-defined functions -- use nabla/edit to define one; "
-           "see )PRIMS for built-ins)\n");
-    return;
-  }
+  int i, any = 0;
   for (i = 0; i < nfns; i++) {
+    if (!oo_rel(fns[i]->key)) continue;
+    any = 1;
     if (fns[i]->lam) printf("%s <- %s\n", fns[i]->name, fns[i]->hdr);
     else printf("%s\n", fns[i]->hdr);
   }
+  if (!any)
+    printf("(no user-defined functions -- use nabla/edit to define one; "
+           "see )PRIMS for built-ins)\n");
 }
 
 static void sys_prims(void)
@@ -5986,6 +7342,9 @@ static void sys_help(void)
    "  )COPY name [obj ...]   bring all (or the named) objects in from a workspace\n"
    "  )ERASE name [name2 ...]   delete variable(s)/function(s) by name\n"
    "  )PROCS        list auxiliary processors and the variables shared with them\n"
+   "  )CS [ns]      change the current namespace (no argument: the root)\n");
+  printf(
+   "  )CLASSES  )NSS  )INTERFACES   list classes, namespaces, interfaces\n"
    "  )HELP  or )?  show this message\n"
    "  )QUIT )EXIT )OFF   end the session\n");
   printf("\n"
@@ -6032,7 +7391,9 @@ static void sys_copy(const char *arg)
     goto done;
   }
   if (nobj == 0) {
+    oo_load_begin();
     run_stream(fp, 1);
+    oo_load_end();
     fclose(fp);
     printf("copied all of %s\n", fn);
     goto done;
@@ -6048,7 +7409,24 @@ static void sys_copy(const char *arg)
     const char *r = t;
     char first[64];
     next_word(&r, first, 64);
-    if (ieq(first, "nabla") || ieq(first, "edit")) {
+    if (oo_is_block(first) && !ieq(first, ":With")) {
+      char bn[64], endw[32];
+      int keep = 0;
+      next_word(&r, bn, 64);
+      strcpy(endw, ieq(first, ":Class") ? ":EndClass" :
+             (ieq(first, ":Interface") ? ":EndInterface" : ":EndNamespace"));
+      { int k = in_list(objs, nobj, bn); if (k) { keep = 1; found[k - 1] = 1; } }
+      if (keep) fprintf(tmp, "%s\n", line);
+      while (read_line(fp, line, (int)sizeof(line))) {
+        char *u = trim_dup(line);
+        const char *ur = u;
+        char fw[32];
+        int end = next_word(&ur, fw, 32) && ieq(fw, endw);
+        free(u);
+        if (keep) fprintf(tmp, "%s\n", line);
+        if (end) break;
+      }
+    } else if (ieq(first, "nabla") || ieq(first, "edit")) {
       HInfo h;
       int keep = 0;
       if (header_parse(r, &h)) {
@@ -6083,7 +7461,9 @@ static void sys_copy(const char *arg)
   }
   fclose(fp);
   rewind(tmp);
+  oo_load_begin();
   run_stream(tmp, 1);
+  oo_load_end();
   fclose(tmp);
   for (i = 0; i < nobj; i++) if (found[i]) nfound++;
   printf("copied %d of %d object(s) from %s\n", nfound, nobj, fn);
@@ -6154,6 +7534,10 @@ static int handle_sys(const char *ln)
   else if (ieq(cmd, ")COPY")) sys_copy(rest);
   else if (ieq(cmd, ")ERASE")) sys_erase(rest);
   else if (ieq(cmd, ")PROCS")) sys_procs();
+  else if (ieq(cmd, ")CS")) sys_cs(rest);
+  else if (ieq(cmd, ")CLASSES")) sys_classes();
+  else if (ieq(cmd, ")NSS")) sys_nss();
+  else if (ieq(cmd, ")INTERFACES")) sys_ifaces();
   else if (ieq(cmd, ")HELP") || strcmp(cmd, ")?") == 0) sys_help();
   else if (ieq(cmd, ")QUIT") || ieq(cmd, ")EXIT") || ieq(cmd, ")OFF")) return 1;
   else printf("apl: unknown system command: %s (try )HELP)\n", cmd);
@@ -6161,35 +7545,63 @@ static int handle_sys(const char *ln)
 }
 
 /* ---------- driving loops ---------- */
+typedef struct SysCtx { const char *ln; int quit; } SysCtx;
+static void sys_thunk(void *a)
+{
+  SysCtx *c = (SysCtx *)a;
+  c->quit = handle_sys(c->ln);
+}
+typedef struct EdCtx { const char *rest; FILE *fp; } EdCtx;
+static void ed_thunk(void *a)
+{
+  EdCtx *c = (EdCtx *)a;
+  enter_editor(c->rest, c->fp);
+}
+
 /* mode 0: script (error aborts, exit 1)   mode 1: load (continue on error)
- * mode 2: REPL (prompts, continue on error) */
-static int run_stream(FILE *fp, int mode)
+ * mode 2: REPL (prompts, continue on error).  With endword, the stream is a
+ * block body and ends at that word (which is consumed). */
+static int run_stream_until(FILE *fp, int mode, const char *endword)
 {
   char line[MAXLINE];
   while (1) {
     char *t;
-    char first[16];
+    char first[32];
     const char *rest;
-    if (mode == 2) { fputs("apl> ", stdout); fflush(stdout); }
+    if (mode == 2 && !endword) { fputs("apl> ", stdout); fflush(stdout); }
     if (!read_line(fp, line, (int)sizeof(line))) {
-      if (mode == 2) printf("\ngoodbye.\n");
+      if (mode == 2 && !endword) printf("\ngoodbye.\n");
       return 0;
     }
     t = trim_dup(line);
     if (t[0] == '\0') { free(t); continue; }
     rest = t;
-    next_word(&rest, first, 16);
+    next_word(&rest, first, 32);
+    if (endword && ieq(first, endword)) { free(t); return 0; }
     if (ieq(first, "nabla") || ieq(first, "edit")) {
       int save = interactive;
+      EdCtx c;
+      int err;
       interactive = (mode == 2);
-      enter_editor(rest, fp);
+      c.rest = rest; c.fp = fp;
+      err = guarded(ed_thunk, &c);
       interactive = save;
       free(t);
+      if (err && mode == 0) return 1;
+      continue;
+    }
+    if (first[0] == ':' && oo_is_block(first)) {
+      int err = oo_block(fp, line, mode);
+      free(t);
+      if (err && mode == 0) return 1;
       continue;
     }
     if (t[0] == ')') {
+      SysCtx c;
       if (mode == 1) { free(t); continue; }     /* ignored inside )LOAD */
-      if (handle_sys(t)) {
+      c.ln = t; c.quit = 0;
+      guarded(sys_thunk, &c);
+      if (c.quit) {
         if (mode == 2) printf("goodbye.\n");
         free(t);
         return 0;
@@ -6200,6 +7612,16 @@ static int run_stream(FILE *fp, int mode)
     if (run_stmt(line) && mode == 0) { free(t); return 1; }
     free(t);
   }
+}
+static int run_stream(FILE *fp, int mode)
+{
+  return run_stream_until(fp, mode, NULL);
+}
+
+static void destroy_thunk(void *a)
+{
+  (void)a;
+  oo_destroy_all();
 }
 
 int main(int argc, char **argv)
@@ -6216,10 +7638,1486 @@ int main(int argc, char **argv)
     interactive = 0;
     rc = run_stream(fp, 0);
     fclose(fp);
+    guarded(destroy_thunk, NULL);
     return rc;
   }
   interactive = 1;
   printf("APL-in-C  --  type )help for commands, )quit to exit\n");
   run_stream(stdin, 2);
+  guarded(destroy_thunk, NULL);
   return 0;
 }
+/* ===== p5b_oosys.c ===== */
+/* p5b_oosys.c - the object layer's statements, system functions and
+ * workspace support:  :Class :Interface :Namespace :With blocks, []NEW
+ * []NS []CS []NL []NQ ..., )CS )CLASSES )NSS, and )SAVE / )LOAD of objects. */
+
+static int run_stream_until(FILE *fp, int mode, const char *endword);
+static void scope_expunge(Scope *s);
+
+/* ---------- guarded execution of one block statement ---------- */
+/* Statements that run outside run_stmt (class bodies and the like) need
+ * their own catch frame, because a bare error would otherwise have nowhere
+ * to land.  Returns 1 if an error was reported. */
+static int guarded(void (*fn)(void *), void *arg)
+{
+  volatile int base = catch_top + 1;
+  volatile int fd = fdepth, tm = ntrk;
+  Scope *volatile ss = cur_scope;
+  Scope *volatile so = cur_owner;
+  if (base >= MAXCATCH) { printf("apl: blocks nested too deeply\n"); return 1; }
+  catch_top = base;
+  if (setjmp(catch_jb[base]) == 0) {
+    fn(arg);
+    catch_top = base - 1;
+    return 0;
+  }
+  catch_top = base - 1;
+  trk_unwind(tm);
+  unwind_frames(fd);
+  br_set = 0;
+  cur_scope = ss;
+  cur_owner = so;
+  oo_flushing = 0;
+  printf("apl: %s error -- %s\n", errkind, errmsg);
+  fflush(stdout);
+  return 1;
+}
+
+/* ---------- name helpers ---------- */
+/* full name of a declaration made while the current scope is cur_scope */
+static void qualify(const char *name, char *out)
+{
+  if (cur_scope && cur_scope->kind == SK_NS) kcat(out, cur_scope->pfx, name);
+  else kcat(out, "", name);
+}
+/* find a class / interface / namespace by a name written in the current
+ * scope: first relative to the current namespace, then absolute */
+static Scope *decl_lookup(const char *name)
+{
+  char key[KEYMAX];
+  Scope *s;
+  if (cur_scope && cur_scope->kind == SK_NS) {
+    kcat(key, cur_scope->pfx, name);
+    s = scope_find_decl(key);
+    if (s) return s;
+  }
+  return scope_find_decl(name);
+}
+
+/* make namespace `full` (and its parents) */
+static Scope *ns_create(const char *full)
+{
+  char buf[KEYMAX];
+  char *p, *start;
+  Scope *par = root_scope(), *s = NULL;
+  size_t n = strlen(full);
+  if (n == 0 || n >= KEYMAX) rt_error("LIMIT ERROR: bad namespace name");
+  strcpy(buf, full);
+  start = buf;
+  for (p = buf;; p++) {
+    if (*p == '.' || *p == '\0') {
+      int end = (*p == '\0');
+      *p = '\0';
+      if (start == p) rt_error("DOMAIN ERROR: empty name in namespace path");
+      s = scope_find_decl(buf);
+      if (!s) {
+        if (var_find(buf, 0) && var_find(buf, 0)->val)
+          rt_error_s("DOMAIN ERROR: name is a variable: ", buf, "");
+        if (fn_find_key(buf))
+          rt_error_s("DOMAIN ERROR: name is a function: ", buf, "");
+        s = scope_new(SK_NS, buf);
+        s->parent = (par->id == 0) ? NULL : par;
+      } else if (s->kind != SK_NS)
+        rt_error_s("DOMAIN ERROR: name is already a class or interface: ", buf, "");
+      par = s;
+      if (end) break;
+      *p = '.';
+      start = p + 1;
+    }
+  }
+  return s;
+}
+
+static int valid_dotted(const char *s)
+{
+  char seg[64];
+  while (*s) {
+    int n = 0;
+    while (*s && *s != '.') { if (n < 63) seg[n++] = *s; s++; }
+    seg[n] = '\0';
+    if (!valid_ident(seg)) return 0;
+    if (*s == '.') { s++; if (!*s) return 0; }
+  }
+  return 1;
+}
+
+/* variables / functions / nested scopes under a prefix */
+static void vars_drop_prefix(const char *pfx)
+{
+  char **keys = NULL;
+  int n = 0, i;
+  size_t pl = strlen(pfx);
+  Var *v;
+  for (i = 0; i < HSIZE; i++)
+    for (v = vtab[i]; v; v = v->next)
+      if (strncmp(v->name, pfx, pl) == 0) {
+        keys = (char **)xrealloc(keys, sizeof(char *) * (size_t)(n + 1));
+        keys[n++] = xstrdup(v->name);
+      }
+  for (i = 0; i < n; i++) { var_drop(keys[i]); free(keys[i]); }
+  free(keys);
+}
+static void fns_drop_scope(Scope *sc)
+{
+  int i;
+  for (i = nfns - 1; i >= 0; i--)
+    if (fns[i]->sc == sc) fn_remove_key(fns[i]->key);
+}
+
+static void class_reset(Scope *cls)
+{
+  int i;
+  fns_drop_scope(cls);
+  vars_drop_prefix(cls->pfx);
+  for (i = 0; i < cls->nmem; i++) { free(cls->mem[i].name); free(cls->mem[i].init); }
+  free(cls->mem); cls->mem = NULL; cls->nmem = 0;
+  free(cls->ifs); cls->ifs = NULL; cls->nif = 0;
+  for (i = 0; i < cls->nbound; i++) fn_free(cls->bound[i]);
+  free(cls->bound); cls->bound = NULL; cls->nbound = 0;
+  cls->base = NULL;
+}
+
+static Member *add_member(Scope *cls, const char *name, int kind, int pub,
+                          int shared, int ro, const char *init)
+{
+  Member *m;
+  Scope *d;
+  if (cls_member(cls, name))
+    rt_error_s("DOMAIN ERROR: duplicate member: ", name, "");
+  if (cls->base && chain_member(cls->base, name, &d))
+    rt_error_s("DOMAIN ERROR: member already exists in a base class: ", name, "");
+  cls->mem = (Member *)xrealloc(cls->mem, sizeof(Member) * (size_t)(cls->nmem + 1));
+  m = &cls->mem[cls->nmem++];
+  m->name = xstrdup(name);
+  m->kind = kind; m->pub = pub; m->shared = shared; m->ro = ro;
+  m->init = init ? xstrdup(init) : NULL;
+  return m;
+}
+
+/* read and throw away lines up to (and including) a line starting endw */
+static void skip_block(FILE *fp, const char *endw)
+{
+  char line[MAXLINE], w[32];
+  while (read_line(fp, line, (int)sizeof(line))) {
+    const char *r = line;
+    if (next_word(&r, w, 32) && ieq(w, endw)) return;
+  }
+}
+
+/* ---------- :Class ---------- */
+typedef struct ClsCtx {
+  FILE *fp;
+  Scope *cls;
+  char line[MAXLINE];
+  int done;
+} ClsCtx;
+
+static int word_is_access(const char *w, int *pub, int *shared, int *ro)
+{
+  if (ieq(w, "Public")) { *pub = 1; return 1; }
+  if (ieq(w, "Private")) { *pub = 0; return 1; }
+  if (ieq(w, "Shared")) { *shared = 1; return 1; }
+  if (ieq(w, "ReadOnly")) { *ro = 1; return 1; }
+  return 0;
+}
+
+static void class_line(void *a)
+{
+  ClsCtx *k = (ClsCtx *)a;
+  Scope *cls = k->cls;
+  const char *rest = k->line;
+  char w[64];
+  if (!next_word(&rest, w, 64)) return;
+  if (w[0] == '#' || ieq(w, "lamp")) return;
+  if (ieq(w, ":EndClass")) { k->done = 1; return; }
+  if (ieq(w, "nabla") || ieq(w, "edit")) {
+    int save = interactive;
+    interactive = 0;
+    enter_editor(rest, k->fp);
+    interactive = save;
+    return;
+  }
+  if (ieq(w, ":Field")) {
+    int pub = 0, shared = 0, ro = 0;
+    char mw[64];
+    char *spec, *arrow, *nn, *ini = NULL;
+    for (;;) {
+      const char *save = rest;
+      if (!next_word(&rest, mw, 64)) rt_error("SYNTAX ERROR: :Field needs a name");
+      if (!word_is_access(mw, &pub, &shared, &ro)) { rest = save; break; }
+    }
+    spec = trim_dup(rest);
+    trk_add(spec, 0);
+    arrow = strstr(spec, "<-");
+    if (arrow) {
+      *arrow = '\0';
+      ini = trim_dup(arrow + 2);
+      trk_add(ini, 0);
+      if (ini[0] == '\0') rt_error("SYNTAX ERROR: :Field initial value missing");
+    }
+    nn = trim_dup(spec);
+    trk_add(nn, 0);
+    if (!valid_ident(nn))
+      rt_error("SYNTAX ERROR: :Field  [Public|Private] [Shared] [ReadOnly] name [<- value]");
+    add_member(cls, nn, M_FIELD, pub, shared, ro, ini);
+    trk_del(nn); free(nn);
+    if (ini) { trk_del(ini); free(ini); }
+    trk_del(spec); free(spec);
+    return;
+  }
+  if (ieq(w, ":Event")) {
+    char nm[64];
+    if (!next_word(&rest, nm, 64) || !valid_ident(nm))
+      rt_error("SYNTAX ERROR: :Event needs a name");
+    add_member(cls, nm, M_EVENT, 1, 0, 0, NULL);
+    return;
+  }
+  if (ieq(w, ":Access") || ieq(w, ":Public") || ieq(w, ":Private") ||
+      ieq(w, ":Shared") || ieq(w, ":Override") || ieq(w, ":Constructor") ||
+      ieq(w, ":Destructor")) {
+    int first = 1;
+    for (;;) {
+      char x[64];
+      if (first) { strcpy(x, w); first = 0; }
+      else if (!next_word(&rest, x, 64)) break;
+      if (ieq(x, ":Access")) continue;
+      if (ieq(x, ":Public") || ieq(x, "Public")) def_flags |= F_PUBLIC;
+      else if (ieq(x, ":Private") || ieq(x, "Private")) def_flags &= ~F_PUBLIC;
+      else if (ieq(x, ":Shared") || ieq(x, "Shared")) def_flags |= F_SHARED;
+      else if (ieq(x, ":Override") || ieq(x, "Override")) def_flags |= F_OVER;
+      else if (ieq(x, ":Constructor")) def_flags |= F_CTOR;
+      else if (ieq(x, ":Destructor")) def_flags |= F_DTOR;
+      else rt_error_s("SYNTAX ERROR: unknown modifier: ", x, "");
+    }
+    return;
+  }
+  if (ieq(w, ":Property")) {
+    int pub = 0, shared = 0, ro = 0;
+    char nm[64], line[MAXLINE], x[32];
+    int ended = 0;
+    for (;;) {
+      const char *save = rest;
+      if (!next_word(&rest, nm, 64)) rt_error("SYNTAX ERROR: :Property needs a name");
+      if (!word_is_access(nm, &pub, &shared, &ro)) { rest = save; break; }
+    }
+    next_word(&rest, nm, 64);
+    if (!valid_ident(nm)) rt_error("SYNTAX ERROR: bad property name");
+    add_member(cls, nm, M_PROP, pub, 0, 0, NULL);
+    def_prop = nm;
+    while (read_line(k->fp, line, (int)sizeof(line))) {
+      const char *r = line;
+      if (!next_word(&r, x, 32)) continue;
+      if (ieq(x, ":EndProperty")) { ended = 1; break; }
+      if (ieq(x, "nabla") || ieq(x, "edit")) {
+        int save = interactive;
+        interactive = 0;
+        enter_editor(r, k->fp);
+        interactive = save;
+      } else if (x[0] != '#' && !ieq(x, "lamp"))
+        printf("apl: only nabla definitions are allowed inside :Property\n");
+    }
+    def_prop = NULL;
+    if (!ended) rt_error("SYNTAX ERROR: :Property without :EndProperty");
+    return;
+  }
+  if (ieq(w, ":Include")) {
+    char nm[64];
+    Scope *ns;
+    int i, n0 = nfns;
+    if (!next_word(&rest, nm, 64)) rt_error("SYNTAX ERROR: :Include needs a namespace");
+    ns = decl_lookup(nm);
+    if (!ns || ns->kind != SK_NS) rt_error_s("VALUE ERROR: no such namespace: ", nm, "");
+    for (i = 0; i < n0; i++) {
+      Fn *f = fns[i];
+      if (f->sc == ns && !f->lam) {
+        char key[KEYMAX];
+        Fn *c = (Fn *)xmalloc(sizeof(Fn));
+        int j;
+        kcat(key, cls->pfx, f->name);
+        *c = *f;
+        c->name = xstrdup(f->name);
+        c->key = xstrdup(key);
+        c->res = f->res ? xstrdup(f->res) : NULL;
+        c->left = f->left ? xstrdup(f->left) : NULL;
+        c->right = f->right ? xstrdup(f->right) : NULL;
+        c->hdr = xstrdup(f->hdr);
+        c->loc = (char **)xmalloc(sizeof(char *) * (size_t)(f->nloc + 1));
+        for (j = 0; j < f->nloc; j++) c->loc[j] = xstrdup(f->loc[j]);
+        c->lines = (char **)xmalloc(sizeof(char *) * (size_t)(f->nlines + 1));
+        c->tk = (Tok **)xmalloc(sizeof(Tok *) * (size_t)(f->nlines + 1));
+        c->label = (char **)xmalloc(sizeof(char *) * (size_t)(f->nlines + 1));
+        c->lines[0] = NULL; c->tk[0] = NULL; c->label[0] = NULL;
+        for (j = 1; j <= f->nlines; j++) {
+          c->lines[j] = xstrdup(f->lines[j]);
+          c->tk[j] = NULL;
+          c->label[j] = f->label[j] ? xstrdup(f->label[j]) : NULL;
+        }
+        c->nstmt = 0; c->stk = NULL; c->optok = NULL;
+        c->cbuilt = 0; c->hasctl = 0; c->ck = NULL; c->cj = NULL;
+        c->sc = cls; c->mflag = F_PUBLIC; c->master = NULL; c->bsc = NULL;
+        fn_install(c);
+      }
+    }
+    return;
+  }
+  rt_error_s("SYNTAX ERROR: unknown statement in a class: ", w, "");
+}
+
+/* checks and shared-field initialisation once the body is complete */
+static void class_finish(void *a)
+{
+  Scope *cls = (Scope *)a;
+  int i, j;
+  /* overrides */
+  for (i = 0; i < nfns; i++) {
+    Fn *f = fns[i];
+    Scope *d;
+    if (f->sc != cls || f->lam) continue;
+    if (f->mflag & (F_CTOR | F_DTOR | F_PGET | F_PSET)) continue;
+    if (cls->base && chain_method(cls->base, f->name, &d)) {
+      if (!(f->mflag & F_OVER))
+        rt_error_s("METHOD ERROR: base method overridden without :Override: ", f->name, "");
+    } else if (f->mflag & F_OVER)
+      rt_error_s("METHOD ERROR: :Override but no base method to override: ", f->name, "");
+  }
+  /* interfaces */
+  for (i = 0; i < cls->nif; i++) {
+    Scope *ifc = cls->ifs[i];
+    for (j = 0; j < ifc->nmem; j++) {
+      Member *m = &ifc->mem[j];
+      Scope *d;
+      char buf[200];
+      if (m->kind == M_METHOD) {
+        Fn *f = chain_method(cls, m->name, &d);
+        if (!f || !(f->mflag & F_PUBLIC)) {
+          sprintf(buf, "INTERFACE ERROR: %.60s must have a public method %.60s",
+                  cls->name, m->name);
+          rt_error(buf);
+        }
+      } else if (m->kind == M_PROP) {
+        Member *p = chain_member(cls, m->name, &d);
+        if (!p || p->kind != M_PROP || !p->pub) {
+          sprintf(buf, "INTERFACE ERROR: %.60s must have a public property %.60s",
+                  cls->name, m->name);
+          rt_error(buf);
+        }
+      } else if (m->kind == M_EVENT) {
+        Member *p = chain_member(cls, m->name, &d);
+        if (!p || p->kind != M_EVENT) {
+          sprintf(buf, "INTERFACE ERROR: %.60s must declare event %.60s",
+                  cls->name, m->name);
+          rt_error(buf);
+        }
+      }
+    }
+  }
+  /* shared fields */
+  for (i = 0; i < cls->nmem; i++) {
+    Member *m = &cls->mem[i];
+    if (m->kind == M_FIELD && m->shared && m->init) {
+      Arr *v;
+      scope_push(cls, cls);
+      v = eval_text(m->init);
+      if (!v) rt_error_s("SYNTAX ERROR: no value for field ", m->name, "");
+      var_set(m->name, v);
+      scope_pop();
+    }
+  }
+}
+
+typedef struct BlkCtx { FILE *fp; const char *line; int mode; int body; int abort; } BlkCtx;
+
+static void blk_class(BlkCtx *b, const char *rest)
+{
+  char nm[64], w[64], full[KEYMAX];
+  Scope *cls, *base = NULL, *ifs[16];
+  int nif = 0, i;
+  ClsCtx *k;
+  if (!next_word(&rest, nm, 64) || !valid_dotted(nm))
+    rt_error("SYNTAX ERROR: :Class needs a name");
+  qualify(nm, full);
+  while (next_word(&rest, w, 64)) {
+    if (ieq(w, ":Extends")) {
+      if (!next_word(&rest, w, 64)) rt_error("SYNTAX ERROR: :Extends needs a class");
+      base = decl_lookup(w);
+      if (!base || base->kind != SK_CLASS)
+        rt_error_s("VALUE ERROR: no such class: ", w, "");
+    } else if (ieq(w, ":Implements")) {
+      const char *save;
+      for (;;) {
+        Scope *ifc;
+        save = rest;
+        if (!next_word(&rest, w, 64)) break;
+        if (w[0] == ':') { rest = save; break; }
+        ifc = decl_lookup(w);
+        if (!ifc || ifc->kind != SK_IFACE)
+          rt_error_s("VALUE ERROR: no such interface: ", w, "");
+        if (nif < 16) ifs[nif++] = ifc;
+      }
+    } else rt_error_s("SYNTAX ERROR: unexpected in :Class header: ", w, "");
+  }
+  cls = scope_find_decl(full);
+  if (cls) {
+    if (cls->kind != SK_CLASS) rt_error_s("DOMAIN ERROR: name is not a class: ", full, "");
+    if (base == cls) rt_error("DOMAIN ERROR: a class cannot extend itself");
+    if (oo_count_instances(cls))
+      rt_error_s("DOMAIN ERROR: class has live instances; cannot redefine: ", full, "");
+    class_reset(cls);
+  } else {
+    if (strchr(full, '.')) {
+      char par[KEYMAX], *dot;
+      strcpy(par, full);
+      dot = strrchr(par, '.');
+      *dot = '\0';
+      ns_create(par);
+    }
+    if (fn_find_key(full) || (var_find(full, 0) && var_find(full, 0)->val))
+      rt_error_s("DOMAIN ERROR: name already in use: ", full, "");
+    cls = scope_new(SK_CLASS, full);
+  }
+  cls->base = base;
+  if (nif > 0) {
+    cls->ifs = (Scope **)xmalloc(sizeof(Scope *) * (size_t)nif);
+    for (i = 0; i < nif; i++) cls->ifs[i] = ifs[i];
+    cls->nif = nif;
+  }
+  k = (ClsCtx *)xmalloc(sizeof(ClsCtx));
+  trk_add(k, 0);
+  k->fp = b->fp; k->cls = cls; k->done = 0;
+  b->body = 1;
+  def_cls = cls;
+  def_flags = 0;
+  def_prop = NULL;
+  while (!k->done) {
+    if (!read_line(b->fp, k->line, (int)sizeof(k->line))) {
+      def_cls = NULL;
+      trk_del(k);
+      free(k);
+      rt_error("SYNTAX ERROR: :Class without :EndClass");
+    }
+    guarded(class_line, k);
+    def_prop = NULL;
+  }
+  def_cls = NULL;
+  def_flags = 0;
+  trk_del(k);
+  free(k);
+  if (guarded(class_finish, cls)) {
+    printf("apl: class %s was not completed and has been removed\n", cls->name);
+    class_reset(cls);
+    scope_expunge(cls);
+    return;
+  }
+  printf("     class %s defined.\n", cls->name);
+}
+
+/* ---------- :Interface ---------- */
+static void blk_iface(BlkCtx *b, const char *rest)
+{
+  char nm[64], line[MAXLINE], w[64], full[KEYMAX];
+  Scope *ifc;
+  const char *r;
+  if (!next_word(&rest, nm, 64) || !valid_dotted(nm))
+    rt_error("SYNTAX ERROR: :Interface needs a name");
+  qualify(nm, full);
+  ifc = scope_find_decl(full);
+  if (ifc) {
+    int i;
+    if (ifc->kind != SK_IFACE) rt_error_s("DOMAIN ERROR: name is not an interface: ", full, "");
+    for (i = 0; i < ifc->nmem; i++) { free(ifc->mem[i].name); free(ifc->mem[i].init); }
+    free(ifc->mem); ifc->mem = NULL; ifc->nmem = 0;
+  } else {
+    if (strchr(full, '.')) {
+      char par[KEYMAX], *dot;
+      strcpy(par, full);
+      dot = strrchr(par, '.');
+      *dot = '\0';
+      ns_create(par);
+    }
+    ifc = scope_new(SK_IFACE, full);
+  }
+  b->body = 1;
+  while (read_line(b->fp, line, (int)sizeof(line))) {
+    int kind = 0;
+    r = line;
+    if (!next_word(&r, w, 64)) continue;
+    if (w[0] == '#' || ieq(w, "lamp")) continue;
+    if (ieq(w, ":EndInterface")) {
+      printf("     interface %s defined.\n", ifc->name);
+      return;
+    }
+    if (ieq(w, ":Method")) kind = M_METHOD;
+    else if (ieq(w, ":Property")) kind = M_PROP;
+    else if (ieq(w, ":Event")) kind = M_EVENT;
+    else { printf("apl: unknown statement in an interface: %s\n", w); continue; }
+    if (!next_word(&r, w, 64) || !valid_ident(w)) {
+      printf("apl: interface member needs a name\n");
+      continue;
+    }
+    ifc->mem = (Member *)xrealloc(ifc->mem, sizeof(Member) * (size_t)(ifc->nmem + 1));
+    ifc->mem[ifc->nmem].name = xstrdup(w);
+    ifc->mem[ifc->nmem].kind = kind;
+    ifc->mem[ifc->nmem].pub = 1;
+    ifc->mem[ifc->nmem].shared = ifc->mem[ifc->nmem].ro = 0;
+    ifc->mem[ifc->nmem].init = NULL;
+    ifc->nmem++;
+  }
+  rt_error("SYNTAX ERROR: :Interface without :EndInterface");
+}
+
+/* ---------- :Namespace and :With ---------- */
+static void blk_ns(BlkCtx *b, const char *rest)
+{
+  char nm[128], full[KEYMAX];
+  Scope *ns, *save = cur_scope, *sowner = cur_owner;
+  if (!next_word(&rest, nm, 128) || !valid_dotted(nm))
+    rt_error("SYNTAX ERROR: :Namespace needs a name");
+  qualify(nm, full);
+  ns = ns_create(full);
+  b->body = 1;
+  cur_scope = ns;
+  cur_owner = NULL;
+  if (run_stream_until(b->fp, b->mode, ":EndNamespace")) b->abort = 1;
+  b->body = 2;
+  cur_scope = save;
+  cur_owner = sowner;
+}
+
+static void blk_with(BlkCtx *b, const char *rest)
+{
+  Arr *v;
+  Scope *sc, *save = cur_scope, *sowner = cur_owner;
+  while (is_space((unsigned char)*rest)) rest++;
+  if (*rest == '\0') rt_error("SYNTAX ERROR: :With needs a namespace or object");
+  v = eval_text(rest);
+  if (!v) rt_error("SYNTAX ERROR: :With needs a value");
+  sc = obj_of(v);
+  if (!sc || !sc->alive || (sc->kind != SK_NS && sc->kind != SK_INST)) {
+    a_rel(v);
+    rt_error("DOMAIN ERROR: :With needs a namespace or an instance");
+  }
+  b->body = 1;
+  cur_scope = (sc->id == 0) ? NULL : sc;
+  cur_owner = NULL;
+  if (run_stream_until(b->fp, b->mode, ":EndWith")) b->abort = 1;
+  b->body = 2;
+  cur_scope = save;
+  cur_owner = sowner;
+  a_rel(v);
+}
+
+static int oo_is_block(const char *first)
+{
+  return ieq(first, ":Class") || ieq(first, ":Interface") ||
+         ieq(first, ":Namespace") || ieq(first, ":With");
+}
+
+static void blk_dispatch(void *a)
+{
+  BlkCtx *b = (BlkCtx *)a;
+  const char *rest = b->line;
+  char w[32];
+  next_word(&rest, w, 32);
+  if (ieq(w, ":Class")) blk_class(b, rest);
+  else if (ieq(w, ":Interface")) blk_iface(b, rest);
+  else if (ieq(w, ":Namespace")) blk_ns(b, rest);
+  else blk_with(b, rest);
+}
+
+/* run one block statement starting at `line`; the body is read from fp */
+static int oo_block(FILE *fp, const char *line, int mode)
+{
+  BlkCtx b;
+  char w[32];
+  const char *rest = line;
+  int err;
+  b.fp = fp; b.line = line; b.mode = mode; b.body = 0; b.abort = 0;
+  err = guarded(blk_dispatch, &b);
+  if (b.abort) err = 1;
+  if (err && b.body == 0) {
+    /* the header was bad: do not run the body as statements */
+    next_word(&rest, w, 32);
+    if (ieq(w, ":Class")) skip_block(fp, ":EndClass");
+    else if (ieq(w, ":Interface")) skip_block(fp, ":EndInterface");
+    else if (ieq(w, ":Namespace")) skip_block(fp, ":EndNamespace");
+    else skip_block(fp, ":EndWith");
+  }
+  def_cls = NULL; def_prop = NULL; def_flags = 0; edit_target = NULL;
+  return err;
+}
+
+/* ---------- expunging ---------- */
+static void scope_expunge(Scope *s)
+{
+  int i;
+  if (cur_scope == s) cur_scope = NULL;
+  vars_drop_prefix(s->pfx);
+  fns_drop_scope(s);
+  s->alive = 0;
+  for (i = 0; i < ndecls; i++)
+    if (decls[i] == s) { decls[i] = decls[--ndecls]; break; }
+  if (s->refc <= 0 && !s->inq) scope_free(s);
+}
+
+/* []EX of a namespace, class or interface */
+static void oo_expunge(Scope *s)
+{
+  int i;
+  if (s->kind == SK_CLASS) {
+    if (oo_count_instances(s))
+      rt_error_s("DOMAIN ERROR: class has live instances: ", s->name, "");
+  }
+  for (i = 0; i < ndecls; i++)
+    if (decls[i]->kind == SK_CLASS && decls[i]->base == s)
+      rt_error_s("DOMAIN ERROR: class is the base of another class: ", s->name, "");
+  if (s->kind == SK_NS) {
+    /* nested declarations go with it */
+    for (i = ndecls - 1; i >= 0; i--) {
+      Scope *d;
+      if (i >= ndecls) continue;
+      d = decls[i];
+      if (d != s && strncmp(d->name, s->pfx, strlen(s->pfx)) == 0) {
+        if (d->kind == SK_CLASS && oo_count_instances(d))
+          rt_error_s("DOMAIN ERROR: class has live instances: ", d->name, "");
+      }
+    }
+    for (i = ndecls - 1; i >= 0; i--) {
+      Scope *d;
+      if (i >= ndecls) continue;
+      d = decls[i];
+      if (d != s && strncmp(d->name, s->pfx, strlen(s->pfx)) == 0)
+        scope_expunge(d);
+    }
+  }
+  scope_expunge(s);
+}
+
+/* )CLEAR: run destructors, then drop every object */
+static void oo_clear_all(void)
+{
+  oo_destroy_all();
+}
+static void oo_clear_finish(void)
+{
+  int i;
+  oo_flush();
+  while (ndecls > 0) scope_expunge(decls[0]);
+  for (i = 0; i < ap_n; ) {
+    if (ap_tab[i].objid) {
+      a_rel(ap_tab[i].oref);
+      for (; i + 1 < ap_n; i++) ap_tab[i] = ap_tab[i + 1];
+      ap_n--;
+      i = 0;
+    } else i++;
+  }
+  a_rel(prop_tmp);
+  prop_tmp = NULL;
+  cur_scope = NULL;
+  cur_owner = NULL;
+}
+
+/* ---------- names, classes of names ---------- */
+static double oo_nc(const char *nm)
+{
+  Res r;
+  Fn *f;
+  Arr *v;
+  if (!cur_scope && !strchr(nm, '.')) {
+    f = fn_find_key(nm);
+    if (f) return f->opn ? 4.0 : 3.0;
+  }
+  if (oo_find(nm, 0, &r)) {
+    if (r.kind == R_FN) return (r.fn->opn) ? 4.0 : 3.0;
+    if (r.kind == R_SCOPE) {
+      switch (r.sc->kind) {
+      case SK_NS: return 9.1;
+      case SK_CLASS: return 9.4;
+      case SK_IFACE: return 9.5;
+      default: return 9.2;
+      }
+    }
+    if (r.kind == R_PROP) return 2.0;
+    if (r.kind == R_VAR) {
+      Var *var = var_find(r.key, 0);
+      if (!var) return 0.0;
+      v = var_value(var);
+      if (!v) return 0.0;
+      if (obj_of(v)) {
+        Scope *o = obj_of(v);
+        return o->kind == SK_INST ? 9.2 : (o->kind == SK_NS ? 9.1 :
+               (o->kind == SK_CLASS ? 9.4 : 9.5));
+      }
+      return 2.0;
+    }
+  }
+  return 0.0;
+}
+
+/* []EX for names that are not variables or functions */
+static int oo_ex(const char *nm)
+{
+  Res r;
+  if (oo_find(nm, 0, &r) && r.kind == R_SCOPE &&
+      r.sc->kind != SK_INST && r.sc->id > 0) {
+    oo_expunge(r.sc);
+    return 1;
+  }
+  return 0;
+}
+
+/* ---------- []NL ---------- */
+typedef struct NameList { char **v; int n; } NameList;
+static void nl_add(NameList *l, const char *s)
+{
+  int i;
+  for (i = 0; i < l->n; i++) if (strcmp(l->v[i], s) == 0) return;
+  l->v = (char **)xrealloc(l->v, sizeof(char *) * (size_t)(l->n + 1));
+  l->v[l->n++] = xstrdup(s);
+}
+static int code_match(double want, double have)
+{
+  if (fabs(want - have) < 1e-9) return 1;
+  if (fabs(want - 9.0) < 1e-9 && have > 9.0 && have < 10.0) return 1;
+  return 0;
+}
+static double scope_code(Scope *o)
+{
+  switch (o->kind) {
+  case SK_NS: return 9.1;
+  case SK_CLASS: return 9.4;
+  case SK_IFACE: return 9.5;
+  default: return 9.2;
+  }
+}
+static void nl_scan(Scope *X, double code, NameList *l)
+{
+  int i, j, root;
+  size_t pl;
+  const char *pfx;
+  Var *v;
+  if (!X) X = cur_scope ? cur_scope : root_scope();
+  if (X->kind == SK_INST || X->kind == SK_CLASS) {
+    Scope *c;
+    for (c = (X->kind == SK_INST ? X->cls : X); c; c = c->base) {
+      for (j = 0; j < c->nmem; j++) {
+        Member *m = &c->mem[j];
+        if (!(m->pub || oo_restoring || cur_owner == c)) continue;
+        if (m->kind == M_FIELD || m->kind == M_PROP) {
+          int ok = 1;
+          if (X->kind == SK_CLASS && !m->shared) ok = 0;
+          if (ok && code_match(code, 2.0)) nl_add(l, m->name);
+        }
+      }
+      for (i = 0; i < nfns; i++) {
+        Fn *f = fns[i];
+        if (f->sc != c || (f->mflag & (F_PGET | F_PSET))) continue;
+        if (!(f->mflag & F_PUBLIC) && !oo_restoring && cur_owner != c) continue;
+        if (X->kind == SK_CLASS && !(f->mflag & F_SHARED)) continue;
+        if (code_match(code, 3.0)) nl_add(l, f->name);
+      }
+    }
+    return;
+  }
+  root = (X->id == 0);
+  pfx = X->pfx;
+  pl = strlen(pfx);
+  for (i = 0; i < HSIZE; i++)
+    for (v = vtab[i]; v; v = v->next) {
+      const char *rest;
+      double c;
+      if (!v->val && !v->ap) continue;
+      if (root) {
+        if (strchr(v->name, '.') || v->name[0] == '\1') continue;
+        rest = v->name;
+      } else {
+        if (strncmp(v->name, pfx, pl) != 0) continue;
+        rest = v->name + pl;
+        if (strchr(rest, '.')) continue;
+      }
+      if (v->val && obj_of(v->val)) c = scope_code(obj_of(v->val));
+      else c = 2.0;
+      if (code_match(code, c)) nl_add(l, rest);
+    }
+  for (i = 0; i < nfns; i++) {
+    Fn *f = fns[i];
+    const char *rest;
+    if (root) {
+      if (strchr(f->key, '.')) continue;
+      rest = f->key;
+    } else {
+      if (strncmp(f->key, pfx, pl) != 0) continue;
+      rest = f->key + pl;
+      if (strchr(rest, '.')) continue;
+    }
+    if (code_match(code, f->opn ? 4.0 : 3.0)) nl_add(l, rest);
+  }
+  for (i = 0; i < ndecls; i++) {
+    Scope *d = decls[i];
+    const char *rest;
+    if (!d->alive) continue;
+    if (root) {
+      if (strchr(d->name, '.')) continue;
+      rest = d->name;
+    } else {
+      if (strncmp(d->name, pfx, pl) != 0) continue;
+      rest = d->name + pl;
+      if (strchr(rest, '.')) continue;
+    }
+    if (code_match(code, scope_code(d))) nl_add(l, rest);
+  }
+}
+
+static int nl_cmp(const void *a, const void *b)
+{
+  return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static Arr *nl_list(Scope *X, Arr *codes)
+{
+  NameList l;
+  int i, w = 0, sh[2];
+  Arr *r;
+  l.v = NULL; l.n = 0;
+  if (codes->type != T_NUM) rt_error("DOMAIN ERROR: []NL needs name-class numbers");
+  for (i = 0; i < codes->n; i++) nl_scan(X, codes->num[i], &l);
+  if (l.n > 1) qsort(l.v, (size_t)l.n, sizeof(char *), nl_cmp);
+  for (i = 0; i < l.n; i++) if ((int)strlen(l.v[i]) > w) w = (int)strlen(l.v[i]);
+  sh[0] = l.n; sh[1] = w;
+  r = a_new(T_CHR, 2, sh);
+  if (l.n * w > 0) memset(r->chr, ' ', (size_t)(l.n * w));
+  for (i = 0; i < l.n; i++) {
+    memcpy(r->chr + i * w, l.v[i], strlen(l.v[i]));
+    free(l.v[i]);
+  }
+  free(l.v);
+  return r;
+}
+
+/* ---------- object-handling system functions ---------- */
+/* items from..n-1 of the nested vector x as a single argument (or NULL) */
+static Arr *items_from(Arr *x, int from)
+{
+  int n = x->n - from, i;
+  Arr *r;
+  if (x->type != T_NEST || n <= 0) return NULL;
+  if (n == 1) return a_item(x, from);
+  r = a_new(T_NEST, 1, &n);
+  for (i = 0; i < n; i++) a_put(r, i, a_item(x, from + i));
+  return a_simplify(r);
+}
+
+static Scope *class_arg(Arr *x, const char *who)
+{
+  Scope *c = obj_of(x);
+  if (!c && x->type == T_CHR && x->rank <= 1) {
+    char *t = text_of(x, who);
+    trk_add(t, 0);
+    c = decl_lookup(t);
+    trk_del(t);
+    free(t);
+  }
+  return c;
+}
+
+static Arr *q_new(Arr *x)
+{
+  Scope *c;
+  if (x->type == T_NEST && x->rank == 1 && x->n >= 1 && obj_of(x->sub[0])) {
+    Arr *args = items_from(x, 1), *r;
+    c = obj_of(x->sub[0]);
+    r = oo_new(c, args);
+    if (args) a_rel(args);
+    return r;
+  }
+  c = class_arg(x, "[]NEW");
+  if (!c) rt_error("DOMAIN ERROR: []NEW needs a class (and its arguments)");
+  return oo_new(c, NULL);
+}
+
+static Arr *q_ns(Arr *x)
+{
+  char *t, full[KEYMAX];
+  Scope *s;
+  if (obj_of(x)) return a_ref(x);
+  t = text_of(x, "[]NS");
+  trk_add(t, 0);
+  if (t[0] == '\0') {
+    s = scope_new(SK_NS, "");
+  } else {
+    if (!valid_dotted(t)) rt_error_s("DOMAIN ERROR: bad namespace name: ", t, "");
+    qualify(t, full);
+    s = ns_create(full);
+  }
+  trk_del(t);
+  free(t);
+  return obj_ref(s);
+}
+
+static Scope *ns_arg(Arr *x, const char *who)
+{
+  Scope *s = obj_of(x);
+  if (!s && x->type == T_CHR && x->rank <= 1) {
+    char *t = text_of(x, who);
+    trk_add(t, 0);
+    if (t[0] == '\0' || strcmp(t, "#") == 0) s = root_scope();
+    else s = decl_lookup(t);
+    trk_del(t);
+    free(t);
+  }
+  if (!s || !s->alive || s->kind != SK_NS) rt_error("DOMAIN ERROR: not a namespace");
+  return s;
+}
+
+static Arr *q_cs(Arr *x)
+{
+  Arr *old = obj_ref(cur_scope ? cur_scope : root_scope());
+  Scope *s = ns_arg(x, "[]CS");
+  cur_scope = (s->id == 0) ? NULL : s;
+  cur_owner = NULL;
+  return old;
+}
+
+static Arr *q_class(Arr *x)
+{
+  Scope *s = obj_of(x);
+  if (!s) rt_error("DOMAIN ERROR: []CLASS needs an object");
+  if (s->kind == SK_INST) return obj_ref(s->cls);
+  if (s->kind == SK_CLASS && s->base) return obj_ref(s->base);
+  return a_vec(T_NUM, 0);
+}
+
+static Arr *q_instances(Arr *x)
+{
+  Scope *c = class_arg(x, "[]INSTANCES");
+  int i, n = 0, k = 0;
+  Arr *r;
+  if (!c || c->kind != SK_CLASS) rt_error("DOMAIN ERROR: []INSTANCES needs a class");
+  for (i = 1; i < nscopes; i++) {
+    Scope *s = scopes[i];
+    if (s && s->alive && s->kind == SK_INST && !s->dying && is_derived(s->cls, c)) n++;
+  }
+  r = a_new(T_NEST, 1, &n);
+  for (i = 1; i < nscopes && k < n; i++) {
+    Scope *s = scopes[i];
+    if (s && s->alive && s->kind == SK_INST && !s->dying && is_derived(s->cls, c))
+      a_put(r, k++, obj_ref(s));
+  }
+  if (n == 0) { a_rel(r); return a_vec(T_NUM, 0); }
+  return r;
+}
+
+static Arr *q_nq(Arr *x)
+{
+  Scope *o;
+  char *ev;
+  Arr *data;
+  if (x->type != T_NEST || x->rank != 1 || x->n < 2 || !(o = obj_of(x->sub[0])) ||
+      x->sub[1]->type != T_CHR)
+    rt_error("DOMAIN ERROR: []NQ needs  object 'Event' [data]");
+  if (o->kind != SK_INST) rt_error("DOMAIN ERROR: events are raised on instances");
+  ev = text_of(x->sub[1], "[]NQ");
+  trk_add(ev, 0);
+  data = items_from(x, 2);
+  oo_raise(o, ev, data);
+  if (data) a_rel(data);
+  trk_del(ev);
+  free(ev);
+  return a_scalar(1.0);
+}
+
+static void idm_clear(void)
+{
+  int i;
+  for (i = 0; i < idm_n; i++) a_rel(idm_ref[i]);
+  free(idm_ref); free(idm_id);
+  idm_ref = NULL; idm_id = NULL; idm_n = 0;
+}
+static Arr *q_obj(Arr *x)
+{
+  Scope *c, *inst;
+  Arr *ref;
+  int id;
+  if (x->type != T_NEST || x->n != 2 || x->sub[0]->type != T_NUM ||
+      x->sub[1]->type != T_CHR)
+    rt_error("DOMAIN ERROR: []OBJ needs  id 'Class'");
+  id = (int)x->sub[0]->num[0];
+  if (x->sub[1]->n == 0) inst = scope_new(SK_NS, "");      /* anonymous */
+  else {
+    c = class_arg(x->sub[1], "[]OBJ");
+    if (!c || c->kind != SK_CLASS) rt_error("VALUE ERROR: []OBJ: no such class");
+    inst = scope_new(SK_INST, c->name);
+    inst->cls = c;
+  }
+  ref = obj_ref(inst);
+  idm_ref = (Arr **)xrealloc(idm_ref, sizeof(Arr *) * (size_t)(idm_n + 1));
+  idm_id = (int *)xrealloc(idm_id, sizeof(int) * (size_t)(idm_n + 1));
+  idm_ref[idm_n] = a_ref(ref);
+  idm_id[idm_n] = id;
+  idm_n++;
+  return ref;
+}
+static Arr *q_objref(Arr *x)
+{
+  int i;
+  if (x->type == T_NUM && x->n == 1) {
+    int id = (int)x->num[0];
+    for (i = 0; i < idm_n; i++)
+      if (idm_id[i] == id) return a_ref(idm_ref[i]);
+    rt_error("VALUE ERROR: []OBJREF: unknown object");
+  }
+  {
+    Scope *s = class_arg(x, "[]OBJREF");
+    if (!s) {
+      char *t = text_of(x, "[]OBJREF");
+      int root = (strcmp(t, "#") == 0);
+      free(t);
+      if (root) return obj_ref(root_scope());
+      rt_error("VALUE ERROR: []OBJREF: no such name");
+    }
+    return obj_ref(s);
+  }
+}
+
+static int oo_quad_is_fn(const char *name)
+{
+  static const char *const names[] = {
+    "NEW", "NS", "CS", "NL", "CLASS", "INSTANCES", "DF", "NQ", "NR", "FIX",
+    "OBJ", "OBJREF", NULL };
+  int i;
+  for (i = 0; names[i]; i++) if (strcmp(name, names[i]) == 0) return 1;
+  return 0;
+}
+
+static Arr *fix_script(Arr *x);
+static Arr *nr_define(Arr *x);
+
+/* monadic system functions of the object layer; 1 if handled */
+static int oo_quad_fn(const char *name, Arr *x, Arr **out)
+{
+  if (strcmp(name, "NEW") == 0) { *out = q_new(x); return 1; }
+  if (strcmp(name, "NS") == 0) { *out = q_ns(x); return 1; }
+  if (strcmp(name, "CS") == 0) { *out = q_cs(x); return 1; }
+  if (strcmp(name, "CLASS") == 0) { *out = q_class(x); return 1; }
+  if (strcmp(name, "INSTANCES") == 0) { *out = q_instances(x); return 1; }
+  if (strcmp(name, "NQ") == 0) { *out = q_nq(x); return 1; }
+  if (strcmp(name, "OBJ") == 0) { *out = q_obj(x); return 1; }
+  if (strcmp(name, "OBJREF") == 0) { *out = q_objref(x); return 1; }
+  if (strcmp(name, "NL") == 0) { *out = nl_list(NULL, x); return 1; }
+  if (strcmp(name, "FIX") == 0) { *out = fix_script(x); return 1; }
+  if (strcmp(name, "NR") == 0) { *out = nr_define(x); return 1; }
+  if (strcmp(name, "DF") == 0) {
+    Scope *o = obj_of(x);
+    if (!o) rt_error("DOMAIN ERROR: []DF needs an object");
+    *out = a_str(obj_text(o));
+    return 1;
+  }
+  return 0;
+}
+
+static int oo_quad_dya(const char *name)
+{
+  return strcmp(name, "ON") == 0 || strcmp(name, "ISA") == 0 ||
+         strcmp(name, "DF") == 0 || strcmp(name, "NL") == 0 ||
+         strcmp(name, "PROC") == 0;
+}
+
+static Arr *quad_dya(const char *name, Arr *x, Arr *y)
+{
+  if (strcmp(name, "ON") == 0) {
+    Scope *o = obj_of(x);
+    char *ev, *path;
+    Scope *save = cur_scope;
+    if (!o || o->kind != SK_INST) rt_error("DOMAIN ERROR: []ON needs an instance on the left");
+    if (y->type != T_NEST || y->rank != 1 || y->n < 2 || y->n > 3 ||
+        y->sub[0]->type != T_CHR || y->sub[1]->type != T_CHR)
+      rt_error("DOMAIN ERROR: []ON needs  'Event' 'Handler'");
+    ev = text_of(y->sub[0], "[]ON");
+    trk_add(ev, 0);
+    path = text_of(y->sub[1], "[]ON");
+    trk_add(path, 0);
+    if (y->n == 3) {
+      Scope *h = obj_of(y->sub[2]);
+      if (!h) rt_error("DOMAIN ERROR: []ON: third item must be an object");
+      cur_scope = (h->id == 0) ? NULL : h;
+    }
+    oo_on(o, ev, path);
+    cur_scope = save;
+    trk_del(path); trk_del(ev);
+    free(path); free(ev);
+    return a_ref(x);
+  }
+  if (strcmp(name, "ISA") == 0) {
+    Scope *o = obj_of(x), *t = class_arg(y, "[]ISA");
+    if (!o) rt_error("DOMAIN ERROR: []ISA needs an object on the left");
+    if (!t) return a_scalar(0.0);
+    if (o->kind == SK_INST) return a_scalar(class_isa(o->cls, t) ? 1.0 : 0.0);
+    if (o->kind == SK_CLASS) return a_scalar(class_isa(o, t) ? 1.0 : 0.0);
+    return a_scalar(0.0);
+  }
+  if (strcmp(name, "DF") == 0) {
+    Scope *o = obj_of(x);
+    char *t;
+    if (!o || o->kind != SK_INST) rt_error("DOMAIN ERROR: []DF needs an instance on the left");
+    t = text_of(y, "[]DF");
+    free(o->df);
+    o->df = t;
+    return a_ref(x);
+  }
+  if (strcmp(name, "NL") == 0) {
+    Scope *o = obj_of(x);
+    if (!o) rt_error("DOMAIN ERROR: []NL needs a namespace or object on the left");
+    return nl_list(o, y);
+  }
+  if (strcmp(name, "PROC") == 0) {
+    Scope *o = obj_of(y);
+    int id;
+    if (x->type != T_NUM || x->n != 1) rt_error("DOMAIN ERROR: []PROC needs a processor number on the left");
+    id = as_int(x->num[0], P_INDEX);
+    if (id < 1) rt_error("DOMAIN ERROR: bad processor number");
+    ap_for_object(o, id);
+    return a_scalar((double)id);
+  }
+  rt_error("SYNTAX ERROR: unknown system function");
+  return NULL;
+}
+
+/* obj.[]NL x  and the like: run the system function inside obj */
+static Arr *oo_quad_in(const char *path, Arr *x)
+{
+  Res r;
+  Arr *res = NULL;
+  if (!oo_find(path, 0, &r) || r.kind != R_QUAD)
+    rt_error_s("VALUE ERROR: no such object or system function: ", path, "");
+  if (strcmp(r.qname, "NL") == 0) return nl_list(r.sc, x);
+  scope_push(r.sc, NULL);
+  res = quad_fn(r.qname, x);
+  scope_pop();
+  return res;
+}
+
+/* ---------- []FIX and []NR ---------- */
+static Arr *fix_script(Arr *x)
+{
+  int nrows, i;
+  char **rows;
+  const char *r;
+  char w[64], nm[128];
+  FILE *tf;
+  if (x->type == T_NEST) {
+    nrows = x->n;
+    rows = (char **)xmalloc(sizeof(char *) * (size_t)(nrows ? nrows : 1));
+    for (i = 0; i < nrows; i++) {
+      Arr *it = x->sub[i];
+      if (it->type != T_CHR || it->rank > 1) {
+        while (--i >= 0) free(rows[i]);
+        free(rows);
+        rt_error("DOMAIN ERROR: []FIX needs text rows");
+      }
+      rows[i] = xstrndup(it->chr, it->n);
+    }
+  } else {
+    nrows = text_rows(x);
+    rows = (char **)xmalloc(sizeof(char *) * (size_t)nrows);
+    for (i = 0; i < nrows; i++) rows[i] = text_row(x, i, nrows);
+  }
+  if (nrows < 1) { free(rows); rt_error("DOMAIN ERROR: []FIX needs the lines of a definition"); }
+  r = rows[0];
+  while (is_space((unsigned char)*r)) r++;
+  if (*r != ':') {
+    for (i = 0; i < nrows; i++) free(rows[i]);
+    free(rows);
+    return fx_define(x);
+  }
+  r = rows[0];
+  next_word(&r, w, 64);
+  nm[0] = '\0';
+  next_word(&r, nm, 128);
+  tf = tmpfile();
+  if (!tf) {
+    for (i = 0; i < nrows; i++) free(rows[i]);
+    free(rows);
+    rt_error("DOMAIN ERROR: []FIX: cannot create a temporary file");
+  }
+  for (i = 0; i < nrows; i++) { fprintf(tf, "%s\n", rows[i]); free(rows[i]); }
+  free(rows);
+  rewind(tf);
+  {
+    Scope *save = cur_scope;
+    int sv = catch_top;
+    run_stream(tf, 1);
+    catch_top = sv;
+    cur_scope = save;
+  }
+  fclose(tf);
+  return a_str(nm);
+}
+
+static Arr *nr_define(Arr *x)
+{
+  Arr *m = quad_fn("CR", x), *r;
+  int rows, w, i, n;
+  if (m->rank != 2) return m;
+  rows = m->shape[0]; w = m->shape[1];
+  r = a_new(T_NEST, 1, &rows);
+  for (i = 0; i < rows; i++) {
+    n = w;
+    while (n > 0 && m->chr[i * w + n - 1] == ' ') n--;
+    {
+      Arr *line = a_vec(T_CHR, n);
+      memcpy(line->chr, m->chr + i * w, (size_t)n);
+      a_put(r, i, line);
+    }
+  }
+  a_rel(m);
+  return r;
+}
+
+/* ---------- )CS )CLASSES )NSS ---------- */
+static void sys_cs(const char *arg)
+{
+  char *a = trim_dup(arg);
+  if (a[0] == '\0' || strcmp(a, "#") == 0) {
+    cur_scope = NULL;
+    printf("#\n");
+  } else {
+    Scope *s = decl_lookup(a);
+    if (!s || s->kind != SK_NS) printf("apl: no such namespace: %s\n", a);
+    else { cur_scope = s; cur_owner = NULL; printf("#.%s\n", s->name); }
+  }
+  free(a);
+}
+
+static void sys_list_kind(int kind, const char *what)
+{
+  char **names = NULL;
+  int n = 0, i;
+  for (i = 0; i < ndecls; i++)
+    if (decls[i]->alive && decls[i]->kind == kind) {
+      names = (char **)xrealloc(names, sizeof(char *) * (size_t)(n + 1));
+      names[n++] = decls[i]->name;
+    }
+  if (n == 0) { printf("(no %s defined)\n", what); free(names); return; }
+  qsort(names, (size_t)n, sizeof(char *), cmp_str);
+  for (i = 0; i < n; i++) {
+    Scope *c = scope_find_decl(names[i]);
+    printf("%s%s", i ? " " : "", names[i]);
+    if (kind == SK_CLASS && c->base) printf("(:%s)", c->base->name);
+  }
+  printf("\n");
+  free(names);
+}
+static void sys_classes(void) { sys_list_kind(SK_CLASS, "classes"); }
+static void sys_nss(void) { sys_list_kind(SK_NS, "namespaces"); }
+static void sys_ifaces(void) { sys_list_kind(SK_IFACE, "interfaces"); }
+
+/* ---------- saving objects ---------- */
+static void emit_fn(FILE *fp, const Fn *f)
+{
+  int j;
+  if (f->lam) { fprintf(fp, "%s <- %s\n", f->name, f->hdr); return; }
+  fprintf(fp, "nabla %s\n", f->hdr);
+  for (j = 1; j <= f->nlines; j++) fprintf(fp, "%s\n", f->lines[j]);
+  fprintf(fp, "nabla\n");
+}
+
+/* the expression that rebuilds a reference (used by emit_expr) */
+static void emit_ref(FILE *fp, Scope *s)
+{
+  if (s->kind == SK_INST || s->anon) fprintf(fp, "([]OBJREF %d)", s->id);
+  else if (s->id == 0) fprintf(fp, "([]OBJREF '#')");
+  else fprintf(fp, "([]OBJREF '%s')", s->name);
+}
+
+static void save_class(FILE *fp, Scope *c)
+{
+  int i, j;
+  fprintf(fp, ":Class %s", c->name);
+  if (c->base) fprintf(fp, " :Extends %s", c->base->name);
+  if (c->nif) {
+    fprintf(fp, " :Implements");
+    for (i = 0; i < c->nif; i++) fprintf(fp, " %s", c->ifs[i]->name);
+  }
+  fprintf(fp, "\n");
+  for (i = 0; i < c->nmem; i++) {
+    Member *m = &c->mem[i];
+    if (m->kind == M_FIELD) {
+      fprintf(fp, ":Field %s%s%s %s", m->pub ? "Public" : "Private",
+              m->shared ? " Shared" : "", m->ro ? " ReadOnly" : "", m->name);
+      if (m->init) fprintf(fp, " <- %s", m->init);
+      fprintf(fp, "\n");
+    } else if (m->kind == M_EVENT) fprintf(fp, ":Event %s\n", m->name);
+    else if (m->kind == M_PROP) {
+      char key[KEYMAX];
+      Fn *g, *s;
+      fprintf(fp, ":Property %s %s\n", m->pub ? "Public" : "Private", m->name);
+      kcat(key, c->pfx, m->name);
+      strcat(key, ":get");
+      g = fn_find_key(key);
+      if (g) emit_fn(fp, g);
+      key[strlen(key) - 4] = '\0';
+      strcat(key, ":set");
+      s = fn_find_key(key);
+      if (s) emit_fn(fp, s);
+      fprintf(fp, ":EndProperty\n");
+    }
+  }
+  for (j = 0; j < nfns; j++) {
+    Fn *f = fns[j];
+    if (f->sc != c || (f->mflag & (F_PGET | F_PSET))) continue;
+    fprintf(fp, ":Access %s%s\n", (f->mflag & F_PUBLIC) ? "Public" : "Private",
+            (f->mflag & F_SHARED) ? " Shared" : "");
+    if (f->mflag & F_OVER) fprintf(fp, ":Override\n");
+    if (f->mflag & F_CTOR) fprintf(fp, ":Constructor\n");
+    if (f->mflag & F_DTOR) fprintf(fp, ":Destructor\n");
+    emit_fn(fp, f);
+  }
+  fprintf(fp, ":EndClass\n");
+}
+
+/* interfaces, classes, namespaces (with their functions) */
+static void oo_save_defs(FILE *fp, int *ncls, int *nns)
+{
+  int i, j;
+  for (i = 0; i < ndecls; i++) {
+    Scope *s = decls[i];
+    if (!s->alive || s->kind != SK_IFACE) continue;
+    fprintf(fp, ":Interface %s\n", s->name);
+    for (j = 0; j < s->nmem; j++)
+      fprintf(fp, ":%s %s\n", s->mem[j].kind == M_METHOD ? "Method" :
+              (s->mem[j].kind == M_PROP ? "Property" : "Event"), s->mem[j].name);
+    fprintf(fp, ":EndInterface\n");
+  }
+  for (i = 1; i < nscopes; i++) {
+    Scope *s = scopes[i];
+    if (s && s->alive && s->kind == SK_CLASS) { save_class(fp, s); (*ncls)++; }
+  }
+  for (i = 1; i < nscopes; i++) {
+    Scope *s = scopes[i];
+    if (s && s->alive && s->kind == SK_NS && !s->anon) {
+      fprintf(fp, ":Namespace %s\n", s->name);
+      for (j = 0; j < nfns; j++)
+        if (fns[j]->sc == s) emit_fn(fp, fns[j]);
+      fprintf(fp, ":EndNamespace\n");
+      (*nns)++;
+    }
+  }
+}
+
+/* instances (and anonymous namespaces) as bare objects */
+static void oo_save_instances(FILE *fp, int *ninst)
+{
+  int i;
+  for (i = 1; i < nscopes; i++) {
+    Scope *s = scopes[i];
+    if (!s || !s->alive || s->dying) continue;
+    if (s->kind == SK_INST)
+      fprintf(fp, "loadtmp_ <- []OBJ (%d) ('%s')\n", s->id, s->cls->name);
+    else if (s->kind == SK_NS && s->anon)
+      fprintf(fp, "loadtmp_ <- []OBJ (%d) (0 rho '')\n", s->id);
+    else continue;
+    (*ninst)++;
+  }
+}
+
+/* values held by namespaces, classes (shared fields) and instances */
+static void oo_save_values(FILE *fp)
+{
+  int i, j;
+  Var *v;
+  char **keys = NULL;
+  int nk = 0;
+  for (i = 0; i < HSIZE; i++)
+    for (v = vtab[i]; v; v = v->next)
+      if (v->val && strchr(v->name, '.') && v->name[0] != '\1') {
+        keys = (char **)xrealloc(keys, sizeof(char *) * (size_t)(nk + 1));
+        keys[nk++] = v->name;
+      }
+  if (nk > 1) qsort(keys, (size_t)nk, sizeof(char *), cmp_str);
+  for (i = 0; i < nk; i++) save_value(fp, keys[i], var_find(keys[i], 0)->val);
+  free(keys);
+  for (i = 1; i < nscopes; i++) {
+    Scope *s = scopes[i];
+    int any = 0;
+    if (!s || !s->alive || s->dying) continue;
+    if (!(s->kind == SK_INST || (s->kind == SK_NS && s->anon))) continue;
+    fprintf(fp, "loadtmp_ <- []OBJREF %d\n", s->id);
+    for (j = 0; j < s->nvk; j++) {
+      Var *var = var_find(s->vk[j], 0);
+      char nm[KEYMAX + 16];
+      if (!var || !var->val) continue;
+      sprintf(nm, "loadtmp_.%s", s->vk[j] + strlen(s->pfx));
+      save_value(fp, nm, var->val);
+    }
+    if (s->df) {
+      const char *p;
+      fprintf(fp, "loadtmp_ <- loadtmp_ []DF '");
+      for (p = s->df; *p; p++) { if (*p == '\'') fputc('\'', fp); fputc(*p, fp); }
+      fprintf(fp, "'\n");
+    }
+    for (j = 0; j < s->nhd; j++) {
+      Scope *h = scope_by_id(s->hd[j].home);
+      fprintf(fp, "loadtmp_ <- loadtmp_ []ON ('%s') ('%s')", s->hd[j].ev, s->hd[j].path);
+      if (h) { fprintf(fp, " "); emit_ref(fp, h); }
+      fprintf(fp, "\n");
+    }
+    for (j = 0; j < nfns; j++)
+      if (fns[j]->sc == s) any = 1;
+    if (any) {
+      fprintf(fp, ":With loadtmp_\n");
+      for (j = 0; j < nfns; j++)
+        if (fns[j]->sc == s) emit_fn(fp, fns[j]);
+      fprintf(fp, ":EndWith\n");
+    }
+  }
+}
+
+/* shared variables and processors */
+static void oo_save_procs(FILE *fp, int *nshare)
+{
+  int i;
+  Var *v;
+  for (i = 0; i < ap_n; i++)
+    if (ap_tab[i].objid)
+      fprintf(fp, "loadtmp_ <- %d []PROC ([]OBJREF %d)\n", ap_tab[i].id,
+              ap_tab[i].objid);
+  for (i = 0; i < HSIZE; i++)
+    for (v = vtab[i]; v; v = v->next)
+      if (v->ap && !strchr(v->name, '.') && v->name[0] != '\1') {
+        fprintf(fp, "loadtmp_ <- %d []SVO '%s'\n", v->ap, v->name);
+        (*nshare)++;
+      }
+}
+
+/* around a workspace load: the root scope, access rules off */
+static Scope *load_save_scope;
+static Scope *load_save_owner;
+static void oo_load_begin(void)
+{
+  load_save_scope = cur_scope;
+  load_save_owner = cur_owner;
+  cur_scope = NULL;
+  cur_owner = NULL;
+  oo_restoring = 1;
+}
+static void oo_load_end(void)
+{
+  oo_restoring = 0;
+  idm_clear();
+  var_set("loadtmp_", NULL);
+  cur_scope = load_save_scope;
+  cur_owner = load_save_owner;
+}
+
+static void flush_thunk(void *a) { (void)a; oo_flush(); }
+static void guarded_flush_(void) { guarded(flush_thunk, NULL); }

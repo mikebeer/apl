@@ -19,6 +19,6 @@ for f in tests/scen/s*.apl; do
   if [ "$got" = "$(cat tests/scen/$n.out)" ]; then pass=$((pass+1)); echo "ok   $n"
   else fail=$((fail+1)); echo "FAIL $n"; printf '%s\n' "$got" | diff - tests/scen/$n.out | head -8; fi
 done
-rm -f nest_ws.apl s11tmp.apl
+rm -f nest_ws.apl s11tmp.apl s20ws.apl s21ws.apl
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

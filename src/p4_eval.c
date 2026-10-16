@@ -1,8 +1,14 @@
 /* p4_eval.c - variables, user functions, parser/evaluator, operators */
 
 /* ---------- variables ---------- */
+/* The workspace keeps one table of variables and one list of functions,
+ * both keyed by an absolute key.  The root (classic APL) workspace uses the
+ * plain name.  A namespace, class or instance (p4b_oo.c) owns a key prefix
+ * ("Util.", "Account.", "\1I7.") so its members are ordinary table entries
+ * with a qualified key.  cur_scope selects the scope that unqualified names
+ * are looked up in (NULL = root = exactly the classic behaviour). */
 typedef struct Var {
-  char *name;
+  char *name;              /* absolute key */
   Arr *val;
   int ap;                  /* processor this variable is shared with, or 0 */
   struct Var *next;
@@ -10,12 +16,36 @@ typedef struct Var {
 #define HSIZE 211
 static Var *vtab[HSIZE];
 
+struct Scope;
+struct Fn;
+struct Member;
+static struct Scope *cur_scope = NULL;  /* NULL: root workspace */
+static struct Scope *cur_owner = NULL;  /* class of the running method */
+static Arr *prop_tmp = NULL;            /* last property-getter result */
+
+#define KEYMAX 300
+#define R_NONE 0
+#define R_VAR 1       /* a variable: key */
+#define R_FN 2        /* a function / bound method: fn */
+#define R_SCOPE 3     /* a namespace, class, interface or instance: sc */
+#define R_PROP 4      /* a property of sc: mem, decl */
+#define R_QUAD 5      /* obj.[]NAME: qname applies to sc */
+typedef struct Res {
+  int kind;
+  char key[KEYMAX];
+  struct Fn *fn;
+  struct Scope *sc, *decl;
+  struct Member *mem;
+  char qname[32];
+} Res;
+
 static unsigned hashname(const char *s)
 {
   unsigned h = 5381u;
   while (*s) h = h * 33u + (unsigned char)*s++;
   return h % HSIZE;
 }
+static void oo_note_var(const char *key);
 static Var *var_find(const char *name, int create)
 {
   unsigned h = hashname(name);
@@ -29,40 +59,88 @@ static Var *var_find(const char *name, int create)
   v->ap = 0;
   v->next = vtab[h];
   vtab[h] = v;
+  if (name[0] == '\1') oo_note_var(name);
   return v;
 }
-static Arr *var_get(const char *name)
+/* scope-aware resolution (p4b_oo.c).  mode: 0 read, 1 write/delete an
+ * existing name, 2 write (create when absent).  Returns 0 if not found. */
+static int oo_find(const char *name, int mode, Res *r);
+static Arr *oo_prop_read(Res *r);
+static void oo_prop_write(Res *r, Arr *a);
+static char *oo_local_key(const char *name);
+static char *oo_fn_key(const char *name);
+
+static Arr *var_value(Var *v)
 {
-  Var *v = var_find(name, 0);
-  if (!v) return NULL;
   if (v->ap) {
-    Arr *g = ap_do_get(v->ap, name);
+    Arr *g = ap_do_get(v->ap, v->name);
     if (g) { a_rel(v->val); v->val = g; }
   }
   return v->val;
 }
-/* takes ownership of one reference to a (may be NULL: unbind) */
-static void var_set(const char *name, Arr *a)
+static Arr *var_get(const char *name)
 {
-  Var *v = var_find(name, a != NULL);
-  if (!v) return;
+  Var *v;
+  if (cur_scope || strchr(name, '.')) {
+    Res r;
+    if (!oo_find(name, 0, &r)) return NULL;
+    if (r.kind == R_PROP) return oo_prop_read(&r);
+    if (r.kind != R_VAR) return NULL;
+    v = var_find(r.key, 0);
+  } else v = var_find(name, 0);
+  if (!v) return NULL;
+  return var_value(v);
+}
+/* store through an exact Var; takes ownership of one reference to a */
+static void var_store(Var *v, Arr *a)
+{
   if (v->ap) {
     if (a) {
-      Arr *rep = ap_do_set(v->ap, name, a);
+      Arr *rep = ap_do_set(v->ap, v->name, a);
       if (rep) { a_rel(a); a = rep; }
     } else {
       int id = v->ap;
       v->ap = 0;
-      ap_do_retract(id, name);
+      ap_do_retract(id, v->name);
     }
   }
   a_rel(v->val);
   v->val = a;
 }
-/* detach the current value (caller owns it) */
-static Arr *var_take(const char *name)
+/* takes ownership of one reference to a (may be NULL: unbind) */
+static void var_set(const char *name, Arr *a)
 {
-  Var *v = var_find(name, 0);
+  Var *v;
+  if (cur_scope || strchr(name, '.')) {
+    Res r;
+    if (!oo_find(name, a != NULL ? 2 : 1, &r)) {
+      if (a) { a_rel(a); rt_error_s("VALUE ERROR: no such member: ", name, ""); }
+      return;
+    }
+    if (r.kind == R_PROP) {
+      if (!a) rt_error("DOMAIN ERROR: a property cannot be expunged");
+      oo_prop_write(&r, a);
+      return;
+    }
+    if (r.kind != R_VAR) {
+      if (a) { a_rel(a); rt_error_s("DOMAIN ERROR: cannot assign to ", name, ""); }
+      return;
+    }
+    v = var_find(r.key, a != NULL);
+  } else v = var_find(name, a != NULL);
+  if (!v) return;
+  var_store(v, a);
+}
+/* exact-key variants (frames restore by absolute key) */
+static void var_set_key(const char *key, Arr *a)
+{
+  Var *v = var_find(key, a != NULL);
+  if (!v) return;
+  var_store(v, a);
+}
+static Arr *var_take_key(const char *key)
+{
+  Var *v = var_find(key, 0);
   Arr *a;
   if (!v) return NULL;
   a = v->val;
@@ -72,7 +150,8 @@ static Arr *var_take(const char *name)
 
 /* ---------- user functions ---------- */
 typedef struct Fn {
-  char *name;
+  char *name;                /* short name */
+  char *key;                 /* absolute key (== name in the root) */
   int arity;                 /* 0, 1, 2 */
   char *res, *left, *right;  /* NULL when absent */
   char *hdr;                 /* header text as shown */
@@ -90,11 +169,18 @@ typedef struct Fn {
   Tok *optok;                /* its body tokens (END-terminated) */
   int cbuilt, hasctl;        /* structured control flow tables */
   int *ck, *cj;              /* kind per line; jump targets (3 per line) */
+  struct Scope *sc;          /* home: namespace, or class of a method */
+  int mflag;                 /* method attributes (F_xxx in p4b_oo.c) */
+  struct Fn *master;         /* bound copy of this method ... */
+  struct Scope *bsc;         /* ... running in this instance/class scope */
 } Fn;
 
 /* ---------- localization frames ---------- */
-typedef struct Saved { const char *name; Arr *val; } Saved;
-typedef struct Frame { Fn *fn; int nsaved; Saved *sv; } Frame;
+typedef struct Saved { char *key; Arr *val; } Saved;
+typedef struct Frame {
+  Fn *fn; int nsaved; Saved *sv;
+  struct Scope *ssc, *sow;   /* caller's scope and owner class */
+} Frame;
 static Frame frames[MAXDEPTH + 2];
 static int fdepth = 0;
 
@@ -103,30 +189,42 @@ static void unwind_frames(int depth)
   while (fdepth > depth) {
     Frame *fr = &frames[--fdepth];
     int i;
-    for (i = fr->nsaved - 1; i >= 0; i--)
-      var_set(fr->sv[i].name, fr->sv[i].val);
+    for (i = fr->nsaved - 1; i >= 0; i--) {
+      var_set_key(fr->sv[i].key, fr->sv[i].val);
+      free(fr->sv[i].key);
+    }
     free(fr->sv);
+    cur_scope = fr->ssc;
+    cur_owner = fr->sow;
   }
 }
 
 static Fn **fns = NULL;
 static int nfns = 0;
 
-static Fn *fn_find(const char *name)
+static Fn *fn_find_key(const char *key)
 {
   int i;
+  for (i = 0; i < nfns; i++)
+    if (strcmp(fns[i]->key, key) == 0) return fns[i];
+  return NULL;
+}
+static Fn *oo_fn(const char *name);
+static Fn *fn_find(const char *name)
+{
   if (name[0] == 's' && strcmp(name, "self") == 0) {
     if (fdepth > 0 && frames[fdepth - 1].fn->lam) return frames[fdepth - 1].fn;
     return NULL;
   }
-  for (i = 0; i < nfns; i++)
-    if (strcmp(fns[i]->name, name) == 0) return fns[i];
-  return NULL;
+  if (cur_scope || strchr(name, '.')) return oo_fn(name);
+  return fn_find_key(name);
 }
 static void fn_free(Fn *f)
 {
   int i;
-  free(f->name); free(f->res); free(f->left); free(f->right); free(f->hdr);
+  if (f->master) { free(f->name); free(f->key); free(f); return; }
+  free(f->name); free(f->key); free(f->res); free(f->left); free(f->right);
+  free(f->hdr);
   for (i = 0; i < f->nloc; i++) free(f->loc[i]);
   free(f->loc);
   for (i = 1; i <= f->nlines; i++) {
@@ -144,8 +242,9 @@ static void fn_free(Fn *f)
 static void fn_install(Fn *f)
 {
   int i;
+  if (!f->key) f->key = xstrdup(f->name);
   for (i = 0; i < nfns; i++)
-    if (strcmp(fns[i]->name, f->name) == 0) {
+    if (strcmp(fns[i]->key, f->key) == 0) {
       fn_free(fns[i]);
       fns[i] = f;
       return;
@@ -153,17 +252,27 @@ static void fn_install(Fn *f)
   fns = (Fn **)xrealloc(fns, sizeof(Fn *) * (size_t)(nfns + 1));
   fns[nfns++] = f;
 }
-static int fn_remove(const char *name)
+static int fn_remove_key(const char *key)
 {
   int i;
   for (i = 0; i < nfns; i++)
-    if (strcmp(fns[i]->name, name) == 0) {
+    if (strcmp(fns[i]->key, key) == 0) {
       fn_free(fns[i]);
       for (; i + 1 < nfns; i++) fns[i] = fns[i + 1];
       nfns--;
       return 1;
     }
   return 0;
+}
+static int fn_remove(const char *name)
+{
+  char *k;
+  int r;
+  if (!cur_scope && !strchr(name, '.')) return fn_remove_key(name);
+  k = oo_fn_key(name);
+  r = fn_remove_key(k);
+  free(k);
+  return r;
 }
 
 /* ---------- branch state ---------- */
@@ -191,6 +300,14 @@ static Fn *lambda_at(Ps *p, int *ntok);
 static int brace_end(const Tok *t, int i);
 static Fn *lambda_make(const Tok *t, int a, int b, const char *name);
 static Arr *call_fn(Fn *f, Arr *left, Arr *right);
+static void oo_enter(Frame *fr, Fn *bound);
+static int oo_quad_dya(const char *name);
+static Arr *quad_dya(const char *name, Arr *x, Arr *y);
+static Arr *oo_quad_in(const char *path, Arr *x);
+static Arr *oo_name_value(const char *name);
+static Arr *oo_quad_value(const char *name);
+static int oo_member_of(Arr *obj, const char *path, Res *r);
+static void fn_install_here(Fn *f);
 static Arr *eval_text(const char *s);
 
 static Arr *need_val(Arr *a)
@@ -637,6 +754,10 @@ static Arr *quad_value(const char *name)
     if (strncmp(errkind, "syntax", 6) == 0) return a_scalar(2.0);
     return a_scalar(11.0);
   }
+  {
+    Arr *o = oo_quad_value(name);
+    if (o) return o;
+  }
   syn_error_s("unknown system name: []", name);
   return NULL;
 }
@@ -750,6 +871,58 @@ static void unexpected(const Tok *t)
   syn_error(buf);
 }
 
+/* index of the ")" matching the "(" at i, or -1 */
+static int paren_end(const Tok *t, int i)
+{
+  int d = 0;
+  for (; t[i].k != K_END; i++) {
+    if (tok_sym(&t[i], "(")) d++;
+    else if (tok_sym(&t[i], ")") && --d == 0) return i;
+  }
+  return -1;
+}
+
+/* (expr).member   p->i is at the "." ; obj is consumed */
+static Arr *member_access(Ps *p, Arr *obj, int allow_args, Fn **mfn)
+{
+  Res r;
+  const char *name;
+  Arr *v = NULL, *res;
+  p->i++;
+  name = p->t[p->i].s;
+  p->i++;
+  if (!oo_member_of(obj, name, &r)) {
+    a_rel(obj);
+    rt_error_s("VALUE ERROR: no such member: ", name, "");
+  }
+  if (r.kind == R_VAR) {
+    Var *var = var_find(r.key, 0);
+    v = var ? var_value(var) : NULL;
+    if (!v) { a_rel(obj); rt_error_s("VALUE ERROR: member has no value: ", name, ""); }
+    res = a_ref(v);
+  } else if (r.kind == R_PROP) {
+    res = a_ref(oo_prop_read(&r));
+  } else if (r.kind == R_FN) {
+    Fn *f = r.fn;
+    if (allow_args && (f->arity >= 1 || f->ambi)) {
+      *mfn = f;
+      return obj;                         /* the caller applies it */
+    }
+    if (f->arity != 0) {
+      a_rel(obj);
+      syn_error_s("a method that takes an argument cannot be used here: ", name);
+    }
+    res = call_fn(f, NULL, NULL);
+    if (!res) { a_rel(obj); syn_error_s("method returned no value: ", name); }
+  } else {
+    a_rel(obj);
+    rt_error_s("DOMAIN ERROR: not a value: ", name, "");
+    res = NULL;
+  }
+  a_rel(obj);
+  return res;
+}
+
 static Arr *parse_item0(Ps *p)
 {
   Tok *t = &p->t[p->i];
@@ -776,6 +949,10 @@ static Arr *parse_item0(Ps *p)
       syn_error("missing closing parenthesis");
     }
     p->i++;
+    if (tok_sym(&p->t[p->i], ".") && p->t[p->i + 1].k == K_NAME) {
+      Fn *dummy = NULL;
+      a = member_access(p, a, 0, &dummy);
+    }
     return a;
   }
   if (t->k == K_QUAD || tok_name(t, "quad")) {
@@ -797,7 +974,11 @@ static Arr *parse_item0(Ps *p)
     if (strcmp(t->s, "zilch") == 0) { p->i++; return a_vec(T_NUM, 0); }
     if (reserved_word(t->s)) unexpected(t);
     v = var_get(t->s);
-    if (!v) syn_error_s("undefined variable: ", t->s);
+    if (!v) {
+      Arr *ob = oo_name_value(t->s);        /* a class / namespace name */
+      if (ob) { p->i++; return ob; }
+      syn_error_s("undefined variable: ", t->s);
+    }
     p->i++;
     return a_ref(v);
   }
@@ -913,12 +1094,14 @@ static Arr *build_strand(Arr **it, int n)
 /* strand items are collected on a global stack so that an error raised
  * while parsing a later item cannot leak a malloc'd buffer */
 
-static Arr *parse_operand(Ps *p)
+static Arr *parse_operand_from(Ps *p, Arr *first)
 {
   int base = sstop, n;
   Arr *r;
   for (;;) {
-    Arr *a = parse_item(p);
+    Arr *a;
+    if (first) { a = first; first = NULL; }
+    else a = parse_item(p);
     if (sstop == sscap) {
       sscap = sscap ? sscap * 2 : 64;
       sstk = (Arr **)xrealloc(sstk, sizeof(Arr *) * (size_t)sscap);
@@ -1139,6 +1322,7 @@ static int dyadic_at(Ps *p, FnRef *f, int *ea)
   *ea = 0;
   if (t->k == K_QNAME && strcmp(t->s, "EA") == 0) { *ea = 1; f->ntok = 1; return 1; }
   if (t->k == K_QNAME && strcmp(t->s, "SVO") == 0) { *ea = 2; f->ntok = 1; return 1; }
+  if (t->k == K_QNAME && oo_quad_dya(t->s)) { *ea = 3; f->ntok = 1; return 1; }
   if (tok_sym(t, "{")) {
     int nt;
     Fn *u = lambda_at(p, &nt);
@@ -1178,12 +1362,22 @@ static Arr *parse_expr(Ps *p)
   Arr *a, *r, *res;
   FnRef f;
   int ea;
+  const char *qdn;
   /* leading function => monadic application */
   if (t->k == K_SYM && (strcmp(t->s, "+") == 0 || strcmp(t->s, "-") == 0)) {
     int id = (t->s[0] == '+') ? P_ADD : P_SUB;
     p->i++;
     r = need_val(parse_expr(p));
     res = prim_mon(id, r);
+    a_rel(r);
+    return res;
+  }
+  if (t->k == K_NAME && strstr(t->s, ".[]") != NULL) {
+    /* obj.[]NL x : a system function evaluated in the scope obj */
+    const char *qn = t->s;
+    p->i++;
+    r = need_val(parse_expr(p));
+    res = oo_quad_in(qn, r);
     a_rel(r);
     return res;
   }
@@ -1238,7 +1432,42 @@ static Arr *parse_expr(Ps *p)
       }
     }
   }
-  a = parse_operand(p);
+  {
+    Arr *pre = NULL;
+    if (tok_sym(&p->t[p->i], "(")) {
+      int e = paren_end(p->t, p->i);
+      if (e > 0 && tok_sym(&p->t[e + 1], ".") && p->t[e + 2].k == K_NAME) {
+        Arr *obj;
+        Fn *mf = NULL;
+        p->i++;
+        obj = need_val(parse_expr(p));
+        if (!tok_sym(&p->t[p->i], ")")) {
+          a_rel(obj);
+          syn_error("missing closing parenthesis");
+        }
+        p->i++;
+        obj = member_access(p, obj, 1, &mf);
+        if (mf) {
+          Arr *rarg = need_val(parse_expr(p));
+          res = call_fn(mf, NULL, rarg);
+          a_rel(rarg);
+          a_rel(obj);
+          return res;
+        }
+        pre = obj;
+        while (tok_sym(&p->t[p->i], "[")) {
+          Arr *ix[MAXRANK], *rr;
+          int nix, ii;
+          nix = parse_index_list(p, ix);
+          rr = select_p(pre, ix, nix);
+          for (ii = 0; ii < nix; ii++) if (ix[ii]) a_rel(ix[ii]);
+          a_rel(pre);
+          pre = rr;
+        }
+      }
+    }
+    a = parse_operand_from(p, pre);
+  }
   if (a && p->t[p->i].k == K_NAME) {
     Fn *uo = fn_find(p->t[p->i].s);
     const PrimDef *pd;
@@ -1258,10 +1487,12 @@ static Arr *parse_expr(Ps *p)
   }
   if (dyadic_at(p, &f, &ea)) {
     if (!a) syn_error("function returned no value");
+    qdn = (ea == 3) ? p->t[p->i].s : NULL;
     p->i += f.ntok;
     f.axis = ea ? -1 : parse_axis_opt(p);
     r = need_val(parse_expr(p));
-    if (ea == 2) res = quad_svo(a, r);
+    if (ea == 3) res = quad_dya(qdn, a, r);
+    else if (ea == 2) res = quad_svo(a, r);
     else if (ea) res = quad_ea(a, r);
     else {
       if (!f.user) cur_axis = f.axis;
@@ -1343,7 +1574,7 @@ static void exec_tokens(Tok *t)
     sprintf(nf->hdr, "dop { %s }", body);
     free(body);
     var_set(t[0].s, NULL);
-    fn_install(nf);
+    fn_install_here(nf);
     return;
   }
   if (t[0].k == K_NAME && tok_sym(&t[1], "<-") && tok_sym(&t[2], "{") &&
@@ -1354,7 +1585,7 @@ static void exec_tokens(Tok *t)
     if (ex && !ex->lam) syn_error_s("name is already a function: ", t[0].s);
     nf = lambda_make(t, 3, brace_end(t, 2), t[0].s);
     var_set(t[0].s, NULL);
-    fn_install(nf);
+    fn_install_here(nf);
     return;
   }
   if (t[0].k == K_NAME && tok_sym(&t[1], "[")) {
@@ -1440,11 +1671,12 @@ static void exec_tokens(Tok *t)
 static void frame_save(Frame *fr, const char *name)
 {
   int i;
+  char *key = oo_local_key(name);
   for (i = 0; i < fr->nsaved; i++)
-    if (strcmp(fr->sv[i].name, name) == 0) return;
+    if (strcmp(fr->sv[i].key, key) == 0) { free(key); return; }
   fr->sv = (Saved *)xrealloc(fr->sv, sizeof(Saved) * (size_t)(fr->nsaved + 1));
-  fr->sv[fr->nsaved].name = name;
-  fr->sv[fr->nsaved].val = var_take(name);
+  fr->sv[fr->nsaved].key = key;
+  fr->sv[fr->nsaved].val = var_take_key(key);
   fr->nsaved++;
 }
 
@@ -1579,6 +1811,7 @@ static Fn *lambda_make(const Tok *t, int a, int b, const char *name)
   int i, st = a, d = 0, uses_alpha = 0;
   char *body = tok_src(t, a, b);
   f->name = xstrdup(name);
+  f->key = NULL; f->sc = NULL; f->mflag = 0; f->master = NULL; f->bsc = NULL;
   f->res = f->left = f->right = NULL;
   f->hdr = (char *)xmalloc(strlen(body) + 5);
   sprintf(f->hdr, "{ %s }", body);
@@ -1694,6 +1927,7 @@ static Arr *call_lambda(Fn *f, Arr *left, Arr *right)
   if (fdepth >= MAXDEPTH) rt_error("DEPTH ERROR: calls nested too deeply");
   fr = &frames[fdepth++];
   fr->fn = f; fr->nsaved = 0; fr->sv = NULL;
+  oo_enter(fr, f);
   for (i = 0; i < f->nloc; i++) frame_save(fr, f->loc[i]);
   if (left) var_set("alpha", a_ref(left));
   var_set("omega", a_ref(right));
@@ -1981,10 +2215,13 @@ static Arr *call_fn(Fn *f, Arr *left, Arr *right)
   int i, pc;
   Arr *result = NULL;
   CSt cs;
+  Fn *bound = f;
+  if (f->master) f = f->master;
   if (f->lam) return call_lambda(f, left, right);
   if (fdepth >= MAXDEPTH) rt_error("DEPTH ERROR: calls nested too deeply");
   fr = &frames[fdepth++];
   fr->fn = f; fr->nsaved = 0; fr->sv = NULL;
+  oo_enter(fr, bound);
   if (f->left) frame_save(fr, f->left);
   if (f->right) frame_save(fr, f->right);
   if (f->res) frame_save(fr, f->res);

@@ -1,0 +1,30 @@
+     R<-get
+     get defined.
+     Make X
+     Make defined.
+     Bye
+     Bye defined.
+     Deposit X
+     Deposit defined.
+     Withdraw X;ok
+     Withdraw defined.
+     R<-Count
+     Count defined.
+     class Bank.Account defined.
+     Make2 X
+     Make2 defined.
+     AddInterest
+     AddInterest defined.
+     class Bank.Savings defined.
+     Ring X
+     Ring defined.
+     class Alarm defined.
+150
+210
+2
+1
+1
+150
+READONLY ERROR: property Balance has no set function
+Account
+Savings

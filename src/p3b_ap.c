@@ -16,7 +16,7 @@
  *                       in place of `value`, or NULL to keep `value`
  *   retract(name)       called when the offer ends
  */
-#define AP_MAXPROC 32
+#define AP_MAXPROC 64
 
 typedef struct ApProc {
   int id;
@@ -26,6 +26,8 @@ typedef struct ApProc {
   Arr *(*get)(const char *var);
   Arr *(*set)(const char *var, Arr *val);
   void (*retract)(const char *var);
+  int objid;                           /* >0: an object acts as the processor */
+  Arr *oref;                           /* ... and this keeps it alive */
 } ApProc;
 
 static ApProc ap_tab[AP_MAXPROC];
@@ -42,7 +44,14 @@ static void ap_register(int id, const char *name, int installed,
   p = &ap_tab[ap_n++];
   p->id = id; p->name = name; p->installed = installed;
   p->offer = offer; p->get = get; p->set = set; p->retract = retract;
+  p->objid = 0; p->oref = NULL;
 }
+
+/* processors that are objects (p4b_oo.c / p5b_oosys.c) */
+static void obj_ap_offer(const ApProc *p, const char *var);
+static Arr *obj_ap_get(const ApProc *p, const char *var);
+static Arr *obj_ap_set(const ApProc *p, const char *var, Arr *val);
+static void obj_ap_retract(const ApProc *p, const char *var);
 
 static ApProc *ap_find(int id)
 {
@@ -65,21 +74,25 @@ static void ap_do_offer(int id, const char *var)
             id, p->name);
     rt_error(buf);
   }
+  if (p->objid) { obj_ap_offer(p, var); return; }
   if (p->offer) p->offer(var);
 }
 static Arr *ap_do_get(int id, const char *var)
 {
   ApProc *p = ap_find(id);
+  if (p && p->objid) return obj_ap_get(p, var);
   return (p && p->get) ? p->get(var) : NULL;
 }
 static Arr *ap_do_set(int id, const char *var, Arr *val)
 {
   ApProc *p = ap_find(id);
+  if (p && p->objid) return obj_ap_set(p, var, val);
   return (p && p->set) ? p->set(var, val) : NULL;
 }
 static void ap_do_retract(int id, const char *var)
 {
   ApProc *p = ap_find(id);
+  if (p && p->objid) { obj_ap_retract(p, var); return; }
   if (p && p->retract) p->retract(var);
 }
 

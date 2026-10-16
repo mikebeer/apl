@@ -1,0 +1,32 @@
+     R<-Fact N
+     Fact defined.
+     R<-Fact N
+     Fact defined.
+     R<-Sum V;t;i
+     Sum defined.
+     R<-Boom X
+     Boom defined.
+     R<-UseRoot X
+     UseRoot defined.
+     class Calc defined.
+     R<-RootFn X
+     RootFn defined.
+120
+120
+10
+no t
+1001
+DOMAIN ERROR: + does not accept a text value
+1005
+24
+0
+root memo
+     R<-GetM O
+     GetM defined.
+77
+     R<-Inner
+     Inner defined.
+     R<-Outer;g
+     Outer defined.
+local
+global

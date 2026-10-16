@@ -89,6 +89,14 @@ static Tok *lex(const char *line)
       while (is_alnum((unsigned char)*q)) q++;
       len = (int)(q - p);
       if (len == 4 && strncmp(p, "lamp", 4) == 0) break;   /* comment */
+      /* dotted path:  ns.name   obj.member   obj.[]NL */
+      while (*q == '.' && (is_alpha((unsigned char)q[1]) ||
+             (q[1] == '[' && q[2] == ']' && is_alpha((unsigned char)q[3])))) {
+        q++;
+        if (*q == '[') q += 2;
+        while (is_alnum((unsigned char)*q)) q++;
+      }
+      len = (int)(q - p);
       k = K_NAME;
       s = xstrndup(p, len);
       p = q;
@@ -127,6 +135,15 @@ static Tok *lex(const char *line)
         const char *b = q;
         while (is_alnum((unsigned char)*q)) q++;
         k = K_QNAME;
+        if (*q == '.' && is_alpha((unsigned char)q[1])) {
+          /* []THIS.member, []ROOT.name ...: a dotted path (K_NAME) */
+          while (*q == '.' && is_alpha((unsigned char)q[1])) {
+            q++;
+            while (is_alnum((unsigned char)*q)) q++;
+          }
+          k = K_NAME;
+          s = xstrndup(p, (int)(q - p));
+        } else
         s = xstrndup(b, (int)(q - b));
       } else {
         k = K_QUAD;
@@ -134,13 +151,16 @@ static Tok *lex(const char *line)
       p = q;
     } else {
       const char *sym = NULL;
-      if (p[0] == '<' && p[1] == '-') sym = "<-";
+      if (p[0] == '.' && n > 0 && is_alpha((unsigned char)p[1]) &&
+          t[n - 1].k == K_SYM &&
+          (t[n - 1].s[0] == ')' || t[n - 1].s[0] == ']') && !t[n - 1].s[1]) sym = ".";
+      else if (p[0] == '<' && p[1] == '-') sym = "<-";
       else if (p[0] == '-' && p[1] == '>') sym = "->";
       else if (p[0] == '<' && p[1] == '=') sym = "<=";
       else if (p[0] == '>' && p[1] == '=') sym = ">=";
       else if (p[0] == '<' && p[1] == '>') sym = "<>";
       if (sym) {
-        k = K_SYM; s = xstrdup(sym); p += 2;
+        k = K_SYM; s = xstrdup(sym); p += strlen(sym);
       } else if (strchr("+-*/<>=();:[]{}", *p)) {
         char one[2];
         one[0] = *p; one[1] = '\0';

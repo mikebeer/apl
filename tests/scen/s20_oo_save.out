@@ -1,0 +1,72 @@
+     interface IName defined.
+     R<-Deep
+     Deep defined.
+     Make L
+     Make defined.
+     R<-Name
+     Name defined.
+     R<-Secret
+     Secret defined.
+     R<-Made
+     Made defined.
+     R<-get
+     get defined.
+     Bye
+     Bye defined.
+     class Item defined.
+     class Store defined.
+     Hear X
+     Hear defined.
+     class Logger defined.
+1
+1
+the apple
+saved 8 variable(s) and 0 function(s) to s20ws.apl
+  also 3 class(es), 1 namespace(s), 6 object(s)
+workspace cleared.
+(no variables defined)
+(no classes defined)
+(no namespaces defined)
+     interface IName defined.
+     R<-get
+     get defined.
+     Make L
+     Make defined.
+     R<-Name
+     Name defined.
+     R<-Secret
+     Secret defined.
+     R<-Made
+     Made defined.
+     Bye
+     Bye defined.
+     class Item defined.
+     class Store defined.
+     Hear X
+     Hear defined.
+     class Logger defined.
+     R<-Deep
+     Deep defined.
+loaded s20ws.apl
+Item Logger Store
+Cfg
+a b lg list n s w x
+apple
+5
+10
+42
+3
+ the apple   #.[Item]
+1
+1
+2
+11 12
+1 2 3
+10
+the apple
+1
+1
+2
+1
+Made
+0

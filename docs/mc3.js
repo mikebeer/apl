@@ -91,7 +91,12 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
      ['[]IO must be 0 or 1  (and similar)', 'A system variable was assigned an impossible value.'],
      ['until: no convergence after 1000000 steps', 'The test of `until` never became true.'],
      ['auxiliary processor n (name) is reserved but not installed', 'A variable was offered to a number that has no code behind it.'],
-     ['no such auxiliary processor: n', 'A variable was offered to a number that is not registered.']],
+     ['no such auxiliary processor: n', 'A variable was offered to a number that is not registered.'],
+     ['ACCESS ERROR: text', 'A private member was used outside its class.'],
+     ['READONLY ERROR: text', 'A read only field or a property without a set function was assigned.'],
+     ['METHOD ERROR: text', 'An :Override has nothing to override, or a base method is replaced without :Override.'],
+     ['INTERFACE ERROR: text', 'A class does not supply a member of an interface it implements, for instance `B must have a public method Foo`.'],
+     ['VALUE ERROR: text', 'An object, class or name that was used is gone: it was expunged, or never existed.']],
     [3800, 5838]);
   table('Syntax messages',
     ['Message', 'Meaning'],
@@ -121,6 +126,7 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
   h2('Language features that are not implemented');
   ul([
     '**Complex numbers.** A function that would give one, such as the square root of a negative number, is a DOMAIN ERROR.',
+    '**Objects** have no `:Trap`, `:Using`, `:Implements Constructor`, class-level `:Field` attributes beyond those of Chapter 11, multiple base classes, or operators in classes. A class that has live instances cannot be redefined. Events are delivered at once and not queued.',
     '**Selective assignment** such as `(2 take v) <- ...`. Use indexed assignment or `amend`.',
     '**Operators written with a function header**, as in APL2. The `dop` form replaces them, and its operands must be functions.',
     '**The []FMT function**, which has a complicated format specification. `format` covers the common cases.',
@@ -143,6 +149,61 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
   p('The language is complete enough for the port to begin, and the port is the next step. It needs: a deck-build step that folds the roughly one hundred source lines longer than 71 columns; a declaration of `setjmp` for GCCLIB under `__CMS__`; a single TEXT file for the loader; and a test on a Hercules VM/370 system. The first auxiliary processor to write there will be AP210, the CMS file system.');
 
   // ======================================================== Appendices
+
+  // ======================================================== 11
+  chapter('Namespaces, Classes and Objects');
+  p('Besides the classic workspace of variables and functions, the interpreter has the object features of Dyalog APL: **namespaces**, **classes**, **instances**, inheritance, **interfaces**, properties and events. They are optional. A program that does not use them runs exactly as before, and `)SAVE` and `)LOAD` keep everything, objects included.');
+  h2('Namespaces');
+  p('A namespace is a named container of variables, functions and other namespaces. It is written as a block that begins with `:Namespace Name` and ends with `:EndNamespace`; the lines between are ordinary assignments and function definitions. A name inside is reached with a dot: `Util.Twice 4`, `Util.k`. Namespaces nest, and a dotted name may be used on the left of an assignment, `Util.k <- 5`.');
+  p('`:With ref` ... `:EndWith` makes the namespace or object `ref` the current scope for the lines in between. `:Include ns` inside a class copies the members of a namespace into it. `[]NS \'\'` makes an anonymous namespace and returns a reference to it, and `)CS Name` changes the current space for the session; `)CS` alone returns to the root.');
+  h2('Classes');
+  p('A class is a block `:Class Name` ... `:EndClass`. Inside it, `:Field` declares data, `:Property` declares a property, `:Event` declares an event, and ordinary `nabla` functions are the methods. A line such as `:Access Public` or `:Override` in front of a function changes how that one function is declared. `:Constructor` and `:Destructor` in front of a function mark it as the one that runs when an instance is made or discarded.');
+  table('Class declarations',
+    ['Line', 'Meaning'],
+    [[':Class Name :Extends Base :Implements I1 I2', 'Start a class, optionally derived from Base and promising the interfaces I1, I2.'],
+     [':Field [Public|Private] [Shared] [ReadOnly] name [<- value]', 'A data member. Private is the default. A Shared field is one value held by the class and seen by every instance. The value is evaluated when the instance is made.'],
+     [':Access Public|Private [Shared]', 'Applies to the next function: whether it can be called from outside, and whether it works on the class instead of an instance.'],
+     [':Override', 'Applies to the next function: it replaces a method of the base class. The name must exist in the base class, and a method that replaces one without :Override is a METHOD ERROR.'],
+     [':Constructor', 'The next function runs when `[]NEW` makes an instance. Its arguments are the arguments of `[]NEW`.'],
+     [':Destructor', 'The next function runs when the last reference to the instance is gone.'],
+     [':Property [Public] Name', 'A property whose functions follow: `R<-get` and `set V`. Without a set function the property is read only.'],
+     [':Event Name', 'Declares an event that instances can raise with `[]NQ`.'],
+     [':Include ns', 'Copies the members of the namespace ns into the class.']],
+    [4200, 5438], { mono: [0] });
+  p('A Private member is visible only to the methods of the class that declares it. Public members are visible everywhere. A constructor and a destructor are always visible to derived classes so that they can call `[]BASE`.');
+  h2('Instances');
+  p('`[]NEW Account 100` makes an instance of Account and passes 100 to its constructor. The result is a **reference**: a scalar value that can be assigned, put in an array, passed to a function and compared with `match`. Two references are equal if they point at the same instance. A reference prints as `#.[Account]`; a class prints as `#.[Class Account]` and an anonymous namespace as `#.[Namespace]`. A member is selected with a dot: `a.Balance`, `a.Deposit 50`, `a.balance <- 7`. The form `(expr).member` selects a member of a computed reference.');
+  p('Inside a method `[]THIS` is the instance, `[]BASE` is the base-class view of it, `[]ROOT` is the root and `[]PARENT` is the space that holds the class. A method called through a reference always runs the version of the instance\'s own class, so an overridden method is found even when the call is made from the base class.');
+  p('When the last reference to an instance is dropped, by assignment, `[]EX`, the end of a function or `)CLEAR`, the destructor runs at the end of the statement that dropped it. An error in a destructor is reported but does not stop the session.');
+  h2('Inheritance and interfaces');
+  p('`:Extends Base` makes a derived class: it has all the fields and methods of Base and may add its own. A derived constructor calls the base constructor with `[]BASE.Name args`. A class has one base class. An interface is a block `:Interface IName` ... `:EndInterface` that lists `:Method`, `:Property` and `:Event` names; a class that says `:Implements IName` must have each of them, or the class is rejected with an INTERFACE ERROR. `obj []ISA Name` is 1 if obj is an instance of the class Name, of a class derived from it, or of a class that implements the interface Name.');
+  h2('Properties and events');
+  p('A property looks like a field: `t.F` calls the get function and `t.F <- 32` calls the set function with the new value. A property with no set function gives READONLY ERROR when assigned. An event is raised with `obj []NQ \'Event\' data`, or `[]NQ obj \'Event\' data`, which calls every handler that was attached with `obj []ON \'Event\' \'handler\'`. A handler is the name of a function, such as `\'w.Ring\'`, and is called with the data.  `[]ON` returns the instance, so it is usually assigned to a dummy variable.');
+  h2('System functions for objects');
+  table('Object system functions',
+    ['Function', 'Result'],
+    [['[]NEW cls args', 'A new instance of the class. `[]NEW cls` has no arguments for the constructor.'],
+     ['[]NS names', 'A new anonymous namespace; with a text, a namespace of that name.'],
+     ['[]CS ns', 'Changes the current space to ns, or to the root for an empty argument.'],
+     ['[]NL k', 'The names of class k in the current space. `ns []NL k` lists those of ns or of an object. Class numbers: 2 variable, 3 function, 9.1 namespace, 9.2 instance, 9.4 class, 9.5 interface.'],
+     ['[]NC names', 'The class number of each name: 0 undefined, 2, 3, 9.1, 9.2, 9.4, 9.5.'],
+     ['[]NR name', 'The source of a method as a matrix, as `[]CR` gives it for a function.'],
+     ['[]FIX lines', 'Defines a namespace, class or interface from its source lines, given as a matrix or a vector of texts. Returns the names defined.'],
+     ['[]EX names', 'Removes variables, functions, namespaces or classes. A class that still has instances or derived classes cannot be removed (DOMAIN ERROR).'],
+     ['obj []ISA name', '1 if obj is an instance of the class or interface name.'],
+     ['[]CLASS obj', 'The class of an instance, as a reference to the class.'],
+     ['[]INSTANCES cls', 'A vector of the live instances of the class.'],
+     ['obj []DF text', 'Sets the text that is shown when obj is displayed.'],
+     ['obj []ON ev handler', 'Attaches a handler to an event of obj.'],
+     ['[]NQ obj ev data', 'Raises the event ev of obj with data.']],
+    [3000, 6638], { mono: [0] });
+  p('The commands `)CLASSES`, `)NSS` and `)INTERFACES` list what is defined, and `)CS` changes the current space. `)FNS` and `)VARS` list the members of the current space. `)SAVE` writes the namespaces, classes and interfaces as source and writes every instance with the values of its fields, and `)LOAD` and `)COPY` read them back.');
+  h2('Objects as processors');
+  p('An instance may serve as an auxiliary processor, so that a shared variable calls its methods. `n []PROC inst` registers the instance as processor number n (any positive number that no processor uses yet), and the class must have the public methods `Offer`, `Get`, `Set` and `Retract`. Afterwards `n []SVO \'Name\'` calls `inst.Offer \'Name\'`; each reference to Name calls `R<-Get \'Name\'`; an assignment calls `\'Name\' Set value`; and `[]SVR` calls `Retract`. Both forms work: the number `n` and the reference `inst` can be used where a processor is named. `)SAVE` records the processor and its shared variables.');
+  h2('An example');
+  p('The program below defines a namespace Bank with a class Account that has a shared count, a read only property and an event, and a class Savings derived from it. It makes two accounts, attaches a handler to the Overdrawn event and shows the property protecting the balance.');
+  run('Objects (examples/oo_account.apl)', 'examples/oo_account.apl');
+
   chapter('Appendix A. Commands', { plain: true, appendix: true });
   table('Commands',
     ['Command', 'Action'],
@@ -202,6 +263,7 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
      ['`[]SVO`', 'Always returns 1 for an accepted offer; there are no coupling degrees.'],
      ['Names', 'Case sensitive. Reserved words cannot be used as names.'],
      ['Output of numbers', 'A negative number is printed with a minus sign; very large numbers are printed with an exponent.'],
+     ['Objects', 'Dyalog style: `:Class`, `[]NEW`, `[]NS`, `[]FIX`. A class is one block in the session, not an editor session; there are no Dyalog-style `:Trap`, `:Using`, `:Implements Constructor`, or `:Field` attributes beyond those in Chapter 11.'],
      ['Numbers beyond 7.0e75', 'DOMAIN ERROR on every machine, to match the VM/370 range.']],
     [2400, 7238]);
   h2('Changes from the REXX prototype');

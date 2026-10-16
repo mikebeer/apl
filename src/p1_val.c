@@ -12,6 +12,8 @@
 #define T_CHR 1
 #define T_NEST 2
 
+struct Scope;                  /* namespace / class / instance (p4b_oo.c) */
+
 typedef struct Arr {
   struct Arr *next, *prev;     /* list of all live arrays (for sweeping) */
   int refc;
@@ -23,6 +25,7 @@ typedef struct Arr {
   char *chr;                   /* T_CHR data (n+1 bytes, NUL terminated) */
   struct Arr **sub;            /* T_NEST items */
   int mark;
+  struct Scope *obj;           /* set on an object-reference handle vector */
 } Arr;
 
 static Arr *all_arrs = NULL;
@@ -49,6 +52,7 @@ static Arr *a_new(int type, int rank, const int *shape)
   a->chr = NULL;
   a->sub = NULL;
   a->mark = 0;
+  a->obj = NULL;
   if (type == T_NUM) {
     a->num = (double *)xmalloc(sizeof(double) * (size_t)a->n);
   } else if (type == T_CHR) {
@@ -71,9 +75,12 @@ static void a_unlink(Arr *a)
   if (a->next) a->next->prev = a->prev;
 }
 static void a_rel(Arr *a);
+static void obj_release(struct Scope *s);
+static const char *obj_text(const struct Scope *s);
 static void a_free(Arr *a)
 {
   a_unlink(a);
+  if (a->obj) obj_release(a->obj);
   if (a->sub) {
     int i;
     for (i = 0; i < a->n; i++) a_rel(a->sub[i]);
@@ -254,6 +261,7 @@ static void sweep_unmarked(void)
     nx = a->next;
     if (!a->mark) {
       a_unlink(a);
+      if (a->obj) obj_release(a->obj);
       free(a->sub); free(a->num); free(a->chr); free(a);
     } else a->mark = 0;
     a = nx;
@@ -494,6 +502,9 @@ static Blk *render_nest(const Arr *a)
 
 static Blk *render(const Arr *a)
 {
+  if (a->obj) return blk_text(obj_text(a->obj));
+  if (a->type == T_NEST && a->rank == 0 && a->sub[0] && a->sub[0]->obj)
+    return blk_text(obj_text(a->sub[0]->obj));
   return (a->type == T_NEST) ? render_nest(a) : render_simple(a);
 }
 

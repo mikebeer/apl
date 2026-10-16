@@ -1,0 +1,71 @@
+     Offer V
+     Offer defined.
+     R<-Get V
+     Get defined.
+     R<-V Set X
+     Set defined.
+     Retract V
+     Retract defined.
+     R<-Log
+     Log defined.
+     class Ticker defined.
+1
+2
+3
+7
+1
+4
+  no.  processor   state
+    1  LOOPBACK    installed
+    2  UPPER       installed
+    3  COUNTER     installed
+  124  AP124       reserved, not installed
+  126  AP126       reserved, not installed
+  210  AP210       reserved, not installed
+  1000  OBJECT      installed
+         shares: X
+    7  OBJECT      installed
+         shares: Y
+1
+1 1 0
+1
+HELLO
+1
+1
+2
+saved 6 variable(s) and 0 function(s) to s21ws.apl
+  also 1 class(es), 0 namespace(s), 1 object(s)
+workspace cleared.
+  no.  processor   state
+    1  LOOPBACK    installed
+    2  UPPER       installed
+    3  COUNTER     installed
+  124  AP124       reserved, not installed
+  126  AP126       reserved, not installed
+  210  AP210       reserved, not installed
+     Offer V
+     Offer defined.
+     R<-Get V
+     Get defined.
+     R<-V Set X
+     Set defined.
+     Retract V
+     Retract defined.
+     R<-Log
+     Log defined.
+     class Ticker defined.
+loaded s21ws.apl
+  no.  processor   state
+    1  LOOPBACK    installed
+    2  UPPER       installed
+         shares: U
+    3  COUNTER     installed
+         shares: C
+  124  AP124       reserved, not installed
+  126  AP126       reserved, not installed
+  210  AP210       reserved, not installed
+  1000  OBJECT      installed
+    7  OBJECT      installed
+         shares: Y
+5
+1 1 0 1

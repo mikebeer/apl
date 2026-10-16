@@ -1,0 +1,48 @@
+     Make X
+     Make defined.
+     Deposit X
+     Deposit defined.
+     R<-Balance
+     Balance defined.
+     R<-Count
+     Count defined.
+     SetOwner N
+     SetOwner defined.
+     R<-Owner
+     Owner defined.
+     Bye
+     Bye defined.
+     class Account defined.
+150
+150
+#.[Account]
+2
+mike
+nobody
+ACCESS ERROR: owner is private
+ACCESS ERROR: kind is read-only
+checking
+5
+1
+0
+3
+ #.[Account]   #.[Account]   #.[Account]
+6
+2
+1
+1
+0
+
+Account
+#.[Class Account]
+1
+Count
+balance
+kind
+Balance
+Count
+Deposit
+Owner
+SetOwner
+DOMAIN ERROR: class Account needs an argument to be created
+#.[Account]

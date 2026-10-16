@@ -24,7 +24,9 @@ and auxiliary processors. It is meant to run later on VM/370 (CMS).
     src/p3_prim.c   scalar and structural primitives (any rank <= 8)
     src/p3b_ap.c    shared variables / auxiliary processors (hooks + demo processors)
     src/p4_eval.c   variables, user functions, parser/evaluator, operators
+    src/p4b_oo.c    namespaces, classes, instances: scopes, access, dispatch, GC
     src/p5_sys.c    nabla editor, ) commands, workspaces, REPL, main
+    src/p5b_oosys.c :Class/:Namespace/:Interface parsers, []NEW []NS []FIX ... , save/load
     src/apl.c       includes the parts; tools/amalg.sh inlines them into
     apl_all.c       ONE self-contained source file (generated; checked in)
 
@@ -162,3 +164,23 @@ assignment, multi-line `:If`/`:While` control words.
   (offer / get / set / retract) registered in `ap_init`.  Demonstration
   processors: 1 LOOPBACK, 2 UPPER, 3 COUNTER; 124, 126 and 210 are reserved.
 * **Manual**: `docs/APL-User-Guide.docx` (`sh docs/make_manual.sh`).
+
+## Objects -- v0.5
+
+Namespaces, classes, instances, inheritance, interfaces, properties and
+events, in the Dyalog manner.  Classic programs are unaffected.
+
+* Blocks: `:Namespace N ... :EndNamespace`, `:Class C [:Extends B]
+  [:Implements I] ... :EndClass`, `:Interface I ... :EndInterface`,
+  `:With ref ... :EndWith`.  In a class: `:Field`, `:Property`, `:Event`,
+  `:Access`, `:Override`, `:Constructor`, `:Destructor`, `:Include`.
+* Use: `a <- []NEW C args`, `a.Method x`, `a.field <- v`, `(expr).member`,
+  `[]THIS []BASE []ROOT []PARENT`, `a []ISA C`, `a []ON 'Event' 'h'`,
+  `[]NQ a 'Event' data`.
+* System: `[]NEW []NS []CS []NL []NC []NR []FIX []EX []CLASS []INSTANCES
+  []DF []NQ []ON []ISA`; commands `)CS )CLASSES )NSS )INTERFACES`.
+* An instance can be an auxiliary processor: `n []PROC inst`, then
+  `n []SVO 'X'` calls its `Offer / Get / Set / Retract` methods.
+* `)SAVE`, `)LOAD`, `)COPY` keep namespaces, classes and instances.
+* Example: `examples/oo_account.apl`; tests `tests/scen/s15`..`s22`;
+  manual Chapter 11.

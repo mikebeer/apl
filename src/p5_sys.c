@@ -1,5 +1,35 @@
 /* p5_sys.c - function editor, system commands, workspaces, REPL, main */
 
+/* object layer (p4b_oo.c, p5b_oosys.c) */
+static int oo_quad_is_fn(const char *name);
+static int oo_quad_fn(const char *name, Arr *x, Arr **out);
+static int oo_is_block(const char *first);
+static int oo_block(FILE *fp, const char *line, int mode);
+static int guarded(void (*fn)(void *), void *arg);
+static double oo_nc(const char *nm);
+static int oo_ex(const char *nm);
+static void oo_clear_all(void);
+static void oo_clear_finish(void);
+static void oo_flush(void);
+static void oo_destroy_all(void);
+static void oo_mark_roots(void);
+static void emit_ref(FILE *fp, struct Scope *s);
+static void emit_fn(FILE *fp, const Fn *f);
+static void oo_save_defs(FILE *fp, int *ncls, int *nns);
+static void oo_save_instances(FILE *fp, int *ninst);
+static void oo_save_values(FILE *fp);
+static void oo_save_procs(FILE *fp, int *nshare);
+static void oo_load_begin(void);
+static void oo_load_end(void);
+static void sys_cs(const char *arg);
+static void sys_classes(void);
+static void sys_nss(void);
+static void sys_ifaces(void);
+static const char *oo_rel(const char *key);
+static Fn *ed_lookup(const char *name);
+static int run_stream_until(FILE *fp, int mode, const char *endword);
+static void guarded_flush_(void);
+
 /* ---------- small string helpers ---------- */
 static char *trim_dup(const char *s)
 {
@@ -149,7 +179,7 @@ static int header_parse(const char *text, HInfo *h)
            h->name);
     return 0;
   }
-  if (var_get(h->name)) {
+  if (!def_cls && var_get(h->name)) {
     printf("apl: %s is already a variable; clear it first, or pick another"
            " name\n", h->name);
     return 0;
@@ -258,6 +288,7 @@ static void fn_commit(const HInfo *h, ELine *el, int nel)
   char buf[512];
   int i;
   f->name = xstrdup(h->name);
+  f->key = NULL; f->sc = NULL; f->mflag = 0; f->master = NULL; f->bsc = NULL;
   f->arity = h->arity;
   f->res = h->res[0] ? xstrdup(h->res) : NULL;
   f->left = h->left[0] ? xstrdup(h->left) : NULL;
@@ -280,7 +311,23 @@ static void fn_commit(const HInfo *h, ELine *el, int nel)
     f->tk[i] = NULL;
     f->label[i] = label_of(f->lines[i]);
   }
-  fn_install(f);
+  fn_install_here(f);
+}
+
+/* the function a nabla command names: inside a :Class body the methods of
+ * that class, otherwise whatever the (possibly dotted) name denotes */
+static Fn *ed_lookup(const char *name)
+{
+  Fn *f;
+  if (def_cls) {
+    char key[KEYMAX];
+    kcat(key, def_cls->pfx, name);
+    return fn_find_key(key);
+  }
+  oo_restoring++;
+  f = fn_find(name);
+  oo_restoring--;
+  return f;
 }
 
 /* the editor. rest = text after "nabla"; fp supplies further lines */
@@ -308,14 +355,18 @@ static void enter_editor(const char *rest, FILE *fp)
     n += next_word(&s, w1, 64);
     n += next_word(&s, w2, 64);
     n += next_word(&s, w3, 64);
-    if (n == 2 && (ieq(w2, "nabla") || ieq(w2, "edit")) && fn_find(w1)) {
-      fn_show(fn_find(w1));
+    if (n == 2 && (ieq(w2, "nabla") || ieq(w2, "edit")) && ed_lookup(w1)) {
+      fn_show(ed_lookup(w1));
       free(ht);
       return;
     }
-    if (n == 1 && fn_find(w1)) existing = fn_find(w1);
+    if (n == 1 && ed_lookup(w1)) {
+      existing = ed_lookup(w1);
+      edit_target = existing;
+    }
     if (existing && existing->lam) {
       printf("%s is a lambda; redefine it with: %s <- { ... }\n", w1, w1);
+      edit_target = NULL;
       free(ht);
       return;
     }
@@ -461,7 +512,8 @@ static int quad_is_fn(const char *name)
          strcmp(name, "CR") == 0 || strcmp(name, "FX") == 0 ||
          strcmp(name, "SIGNAL") == 0 || strcmp(name, "DL") == 0 ||
          strcmp(name, "VFI") == 0 || strcmp(name, "SVO") == 0 ||
-         strcmp(name, "SVR") == 0 || strcmp(name, "SVQ") == 0;
+         strcmp(name, "SVR") == 0 || strcmp(name, "SVQ") == 0 ||
+         oo_quad_is_fn(name);
 }
 
 /* row i of a text vector/matrix (blank-trimmed), as a new C string */
@@ -526,9 +578,12 @@ static Arr *quad_svo(Arr *proc, Arr *names)
 {
   int nrows, i, id;
   Arr *r;
-  need_num(proc, P_INDEX);
-  if (proc->n != 1) rt_error("RANK ERROR: []SVO needs one processor number on the left");
-  id = as_int(proc->num[0], P_INDEX);
+  if (obj_of(proc)) id = ap_for_object(obj_of(proc), 0);
+  else {
+    need_num(proc, P_INDEX);
+    if (proc->n != 1) rt_error("RANK ERROR: []SVO needs one processor number on the left");
+    id = as_int(proc->num[0], P_INDEX);
+  }
   nrows = text_rows(names);
   r = a_vec(T_NUM, nrows);
   for (i = 0; i < nrows; i++) {
@@ -551,6 +606,10 @@ static Arr *quad_svo(Arr *proc, Arr *names)
 static Arr *quad_fn(const char *name, Arr *x)
 {
   int nrows, i;
+  {
+    Arr *o;
+    if (oo_quad_fn(name, x, &o)) return o;
+  }
   if (strcmp(name, "SVO") == 0 || strcmp(name, "SVR") == 0) {
     Arr *r;
     int retract = (name[2] == 'R');
@@ -671,7 +730,7 @@ static Arr *quad_fn(const char *name, Arr *x)
     nrows = text_rows(x);
     if (nrows != 1) rt_error("RANK ERROR: []CR takes one name");
     nm = text_row(x, 0, 1);
-    f = fn_find(nm);
+    f = ed_lookup(nm);
     free(nm);
     if (!f) return a_vec(T_CHR, 0);
     if (f->lam) {
@@ -699,16 +758,17 @@ static Arr *quad_fn(const char *name, Arr *x)
     r = a_vec(T_NUM, nrows);
     for (i = 0; i < nrows; i++) {
       char *nm = text_row(x, i, nrows);
-      int cls = 0;
+      double cls = 0;
+      trk_add(nm, 0);
       if (strcmp(name, "NC") == 0) {
-        if (fn_find(nm)) cls = 3;
-        else if (var_get(nm)) cls = 2;
-        else cls = 0;
+        cls = oo_nc(nm);
       } else {
-        if (fn_find(nm)) cls = fn_remove(nm);
+        if (fn_find(nm)) cls = (double)fn_remove(nm);
         else if (var_get(nm)) { var_set(nm, NULL); cls = 1; }
+        else cls = (double)oo_ex(nm);
       }
-      r->num[i] = (double)cls;
+      r->num[i] = cls;
+      trk_del(nm);
       free(nm);
     }
     if (nrows == 1) {
@@ -728,27 +788,43 @@ static void mark_roots(void)
   for (i = 0; i < HSIZE; i++)
     for (v = vtab[i]; v; v = v->next)
       if (v->val) mark_arr(v->val);
+  oo_mark_roots();
 }
 
-/* run one statement; returns 0 on success, 1 on error (message printed) */
+/* run one statement; returns 0 on success, 1 on error (message printed).
+ * Statements may nest (a block body, []FIX), so each uses the next catch
+ * slot and only the outermost one sweeps unreachable arrays. */
 static int run_stmt(const char *ln)
 {
-  catch_top = 0;
-  sstop = 0;
-  if (setjmp(catch_jb[0]) == 0) {
+  volatile int base = catch_top + 1;
+  volatile int fd = fdepth, tm = ntrk;
+  if (base >= MAXCATCH) { printf("apl: statements nested too deeply\n"); return 1; }
+  catch_top = base;
+  if (base == 0) sstop = 0;
+  if (setjmp(catch_jb[base]) == 0) {
     Tok *t = lex_t(ln);
     exec_tokens(t);
     lex_free(t);
+    oo_flush();
+    catch_top = base - 1;
     return 0;
   }
-  catch_top = 0;
-  trk_unwind(0);
-  unwind_frames(0);
+  catch_top = base;
+  trk_unwind(tm);
+  unwind_frames(fd);
   br_set = 0;
+  oo_flushing = 0;
   printf("apl: %s error -- %s\n", errkind, errmsg);
   fflush(stdout);
-  mark_roots();
-  sweep_unmarked();
+  if (base == 0 && fd == 0) {
+    mark_roots();
+    sweep_unmarked();
+  }
+  catch_top = base - 1;
+  if (base == 0) {
+    /* destroy what the failed statement left unreachable */
+    guarded_flush_();
+  }
   return 1;
 }
 
@@ -855,6 +931,11 @@ static void emit_simple(FILE *fp, const Arr *a)
 static void emit_expr(FILE *fp, const Arr *a)
 {
   int i;
+  if (a->obj) { emit_ref(fp, a->obj); return; }
+  if (a->type == T_NEST && a->rank == 0 && a->sub[0] && a->sub[0]->obj) {
+    emit_ref(fp, a->sub[0]->obj);
+    return;
+  }
   if (a->type != T_NEST) { emit_simple(fp, a); return; }
   if (a->rank == 0) {
     fprintf(fp, "enclose (");
@@ -931,7 +1012,7 @@ static void save_value(FILE *fp, const char *name, const Arr *a)
 static void sys_save(const char *arg)
 {
   char *name = trim_dup(arg), *fn;
-  int nv = 0, nf = 0, i, nn = 0;
+  int nv = 0, nf = 0, i, nn = 0, ncls = 0, nns = 0, ninst = 0, nshare = 0;
   Var *v;
   char **names = NULL;
   FILE *fp;
@@ -943,16 +1024,16 @@ static void sys_save(const char *arg)
   }
   for (i = 0; i < HSIZE; i++)
     for (v = vtab[i]; v; v = v->next)
-      if (v->val) {
+      if (v->val && !strchr(v->name, '.') && v->name[0] != '\1') {
         names = (char **)xrealloc(names, sizeof(char *) * (size_t)(nn + 1));
         names[nn++] = v->name;
       }
-  if (nn == 0 && nfns == 0) {
+  if (nn == 0 && nfns == 0 && ndecls == 0 && nscopes <= 1) {
     printf("(nothing to save)\n");
     free(name); free(names);
     return;
   }
-  qsort(names, (size_t)nn, sizeof(char *), cmp_str);
+  if (nn > 1) qsort(names, (size_t)nn, sizeof(char *), cmp_str);
   fn = ws_file_name(name);
   fp = fopen(fn, "w");
   if (!fp) {
@@ -961,22 +1042,18 @@ static void sys_save(const char *arg)
     return;
   }
   fprintf(fp, "# saved by )SAVE\n");
-  for (i = 0; i < nn; i++) { save_value(fp, names[i], var_get(names[i])); nv++; }
-  for (i = 0; i < nfns; i++) {
-    int j;
-    if (fns[i]->lam) {
-      fprintf(fp, "%s <- %s\n", fns[i]->name, fns[i]->hdr);
-      nf++;
-      continue;
-    }
-    fprintf(fp, "nabla %s\n", fns[i]->hdr);
-    for (j = 1; j <= fns[i]->nlines; j++) fprintf(fp, "%s\n", fns[i]->lines[j]);
-    fprintf(fp, "nabla\n");
-    nf++;
-  }
+  for (i = 0; i < nfns; i++)
+    if (!fns[i]->sc) { emit_fn(fp, fns[i]); nf++; }
+  oo_save_defs(fp, &ncls, &nns);
+  oo_save_instances(fp, &ninst);
+  for (i = 0; i < nn; i++) { save_value(fp, names[i], var_find(names[i], 0)->val); nv++; }
+  oo_save_values(fp);
+  oo_save_procs(fp, &nshare);
   fclose(fp);
   { char *b = ws_base_name(fn); strncpy(wsid, b, sizeof(wsid) - 1); free(b); }
   printf("saved %d variable(s) and %d function(s) to %s\n", nv, nf, fn);
+  if (ncls || nns || ninst)
+    printf("  also %d class(es), %d namespace(s), %d object(s)\n", ncls, nns, ninst);
   free(name); free(fn); free(names);
 }
 
@@ -998,7 +1075,9 @@ static void sys_load(const char *arg)
     free(name); free(fn);
     return;
   }
+  oo_load_begin();
   run_stream(fp, 1);
+  oo_load_end();
   fclose(fp);
   { char *b = ws_base_name(fn); strncpy(wsid, b, sizeof(wsid) - 1); free(b); }
   printf("loaded %s\n", fn);
@@ -1009,12 +1088,14 @@ static void sys_clear(void)
 {
   int i;
   Var *v;
-  while (nfns > 0) fn_remove(fns[0]->name);
+  oo_clear_all();
+  while (nfns > 0) fn_remove_key(fns[0]->key);
   for (i = 0; i < HSIZE; i++)
     for (v = vtab[i]; v; v = v->next) {
       if (v->ap) { int id = v->ap; v->ap = 0; ap_do_retract(id, v->name); }
       a_rel(v->val); v->val = NULL;
     }
+  oo_clear_finish();
   Q_IO = 1;
   Q_PP = 6;
   strcpy(wsid, "CLEAR WS");
@@ -1028,9 +1109,9 @@ static void sys_vars(void)
   Var *v;
   for (i = 0; i < HSIZE; i++)
     for (v = vtab[i]; v; v = v->next)
-      if (v->val) {
+      if (v->val && oo_rel(v->name)) {
         names = (char **)xrealloc(names, sizeof(char *) * (size_t)(n + 1));
-        names[n++] = v->name;
+        names[n++] = (char *)oo_rel(v->name);
       }
   if (n == 0) { printf("(no variables defined)\n"); free(names); return; }
   qsort(names, (size_t)n, sizeof(char *), cmp_str);
@@ -1041,16 +1122,16 @@ static void sys_vars(void)
 
 static void sys_fns(void)
 {
-  int i;
-  if (nfns == 0) {
-    printf("(no user-defined functions -- use nabla/edit to define one; "
-           "see )PRIMS for built-ins)\n");
-    return;
-  }
+  int i, any = 0;
   for (i = 0; i < nfns; i++) {
+    if (!oo_rel(fns[i]->key)) continue;
+    any = 1;
     if (fns[i]->lam) printf("%s <- %s\n", fns[i]->name, fns[i]->hdr);
     else printf("%s\n", fns[i]->hdr);
   }
+  if (!any)
+    printf("(no user-defined functions -- use nabla/edit to define one; "
+           "see )PRIMS for built-ins)\n");
 }
 
 static void sys_prims(void)
@@ -1110,6 +1191,9 @@ static void sys_help(void)
    "  )COPY name [obj ...]   bring all (or the named) objects in from a workspace\n"
    "  )ERASE name [name2 ...]   delete variable(s)/function(s) by name\n"
    "  )PROCS        list auxiliary processors and the variables shared with them\n"
+   "  )CS [ns]      change the current namespace (no argument: the root)\n");
+  printf(
+   "  )CLASSES  )NSS  )INTERFACES   list classes, namespaces, interfaces\n"
    "  )HELP  or )?  show this message\n"
    "  )QUIT )EXIT )OFF   end the session\n");
   printf("\n"
@@ -1156,7 +1240,9 @@ static void sys_copy(const char *arg)
     goto done;
   }
   if (nobj == 0) {
+    oo_load_begin();
     run_stream(fp, 1);
+    oo_load_end();
     fclose(fp);
     printf("copied all of %s\n", fn);
     goto done;
@@ -1172,7 +1258,24 @@ static void sys_copy(const char *arg)
     const char *r = t;
     char first[64];
     next_word(&r, first, 64);
-    if (ieq(first, "nabla") || ieq(first, "edit")) {
+    if (oo_is_block(first) && !ieq(first, ":With")) {
+      char bn[64], endw[32];
+      int keep = 0;
+      next_word(&r, bn, 64);
+      strcpy(endw, ieq(first, ":Class") ? ":EndClass" :
+             (ieq(first, ":Interface") ? ":EndInterface" : ":EndNamespace"));
+      { int k = in_list(objs, nobj, bn); if (k) { keep = 1; found[k - 1] = 1; } }
+      if (keep) fprintf(tmp, "%s\n", line);
+      while (read_line(fp, line, (int)sizeof(line))) {
+        char *u = trim_dup(line);
+        const char *ur = u;
+        char fw[32];
+        int end = next_word(&ur, fw, 32) && ieq(fw, endw);
+        free(u);
+        if (keep) fprintf(tmp, "%s\n", line);
+        if (end) break;
+      }
+    } else if (ieq(first, "nabla") || ieq(first, "edit")) {
       HInfo h;
       int keep = 0;
       if (header_parse(r, &h)) {
@@ -1207,7 +1310,9 @@ static void sys_copy(const char *arg)
   }
   fclose(fp);
   rewind(tmp);
+  oo_load_begin();
   run_stream(tmp, 1);
+  oo_load_end();
   fclose(tmp);
   for (i = 0; i < nobj; i++) if (found[i]) nfound++;
   printf("copied %d of %d object(s) from %s\n", nfound, nobj, fn);
@@ -1278,6 +1383,10 @@ static int handle_sys(const char *ln)
   else if (ieq(cmd, ")COPY")) sys_copy(rest);
   else if (ieq(cmd, ")ERASE")) sys_erase(rest);
   else if (ieq(cmd, ")PROCS")) sys_procs();
+  else if (ieq(cmd, ")CS")) sys_cs(rest);
+  else if (ieq(cmd, ")CLASSES")) sys_classes();
+  else if (ieq(cmd, ")NSS")) sys_nss();
+  else if (ieq(cmd, ")INTERFACES")) sys_ifaces();
   else if (ieq(cmd, ")HELP") || strcmp(cmd, ")?") == 0) sys_help();
   else if (ieq(cmd, ")QUIT") || ieq(cmd, ")EXIT") || ieq(cmd, ")OFF")) return 1;
   else printf("apl: unknown system command: %s (try )HELP)\n", cmd);
@@ -1285,35 +1394,63 @@ static int handle_sys(const char *ln)
 }
 
 /* ---------- driving loops ---------- */
+typedef struct SysCtx { const char *ln; int quit; } SysCtx;
+static void sys_thunk(void *a)
+{
+  SysCtx *c = (SysCtx *)a;
+  c->quit = handle_sys(c->ln);
+}
+typedef struct EdCtx { const char *rest; FILE *fp; } EdCtx;
+static void ed_thunk(void *a)
+{
+  EdCtx *c = (EdCtx *)a;
+  enter_editor(c->rest, c->fp);
+}
+
 /* mode 0: script (error aborts, exit 1)   mode 1: load (continue on error)
- * mode 2: REPL (prompts, continue on error) */
-static int run_stream(FILE *fp, int mode)
+ * mode 2: REPL (prompts, continue on error).  With endword, the stream is a
+ * block body and ends at that word (which is consumed). */
+static int run_stream_until(FILE *fp, int mode, const char *endword)
 {
   char line[MAXLINE];
   while (1) {
     char *t;
-    char first[16];
+    char first[32];
     const char *rest;
-    if (mode == 2) { fputs("apl> ", stdout); fflush(stdout); }
+    if (mode == 2 && !endword) { fputs("apl> ", stdout); fflush(stdout); }
     if (!read_line(fp, line, (int)sizeof(line))) {
-      if (mode == 2) printf("\ngoodbye.\n");
+      if (mode == 2 && !endword) printf("\ngoodbye.\n");
       return 0;
     }
     t = trim_dup(line);
     if (t[0] == '\0') { free(t); continue; }
     rest = t;
-    next_word(&rest, first, 16);
+    next_word(&rest, first, 32);
+    if (endword && ieq(first, endword)) { free(t); return 0; }
     if (ieq(first, "nabla") || ieq(first, "edit")) {
       int save = interactive;
+      EdCtx c;
+      int err;
       interactive = (mode == 2);
-      enter_editor(rest, fp);
+      c.rest = rest; c.fp = fp;
+      err = guarded(ed_thunk, &c);
       interactive = save;
       free(t);
+      if (err && mode == 0) return 1;
+      continue;
+    }
+    if (first[0] == ':' && oo_is_block(first)) {
+      int err = oo_block(fp, line, mode);
+      free(t);
+      if (err && mode == 0) return 1;
       continue;
     }
     if (t[0] == ')') {
+      SysCtx c;
       if (mode == 1) { free(t); continue; }     /* ignored inside )LOAD */
-      if (handle_sys(t)) {
+      c.ln = t; c.quit = 0;
+      guarded(sys_thunk, &c);
+      if (c.quit) {
         if (mode == 2) printf("goodbye.\n");
         free(t);
         return 0;
@@ -1324,6 +1461,16 @@ static int run_stream(FILE *fp, int mode)
     if (run_stmt(line) && mode == 0) { free(t); return 1; }
     free(t);
   }
+}
+static int run_stream(FILE *fp, int mode)
+{
+  return run_stream_until(fp, mode, NULL);
+}
+
+static void destroy_thunk(void *a)
+{
+  (void)a;
+  oo_destroy_all();
 }
 
 int main(int argc, char **argv)
@@ -1340,10 +1487,12 @@ int main(int argc, char **argv)
     interactive = 0;
     rc = run_stream(fp, 0);
     fclose(fp);
+    guarded(destroy_thunk, NULL);
     return rc;
   }
   interactive = 1;
   printf("APL-in-C  --  type )help for commands, )quit to exit\n");
   run_stream(stdin, 2);
+  guarded(destroy_thunk, NULL);
   return 0;
 }

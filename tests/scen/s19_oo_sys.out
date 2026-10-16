@@ -1,0 +1,38 @@
+     Push X
+     Push defined.
+     R<-Size
+     Size defined.
+     R<-Me
+     Me defined.
+     class Lib.Stack defined.
+Lib.Stack
+Lib
+2
+3 4
+99 4
+1
+9.1
+9.2
+9.4
+2
+3
+0
+R<-Size
+    R<-tally items
+ R<-Size       R<-tally items
+     class Q defined.
+Q
+7
+my Q
+my Q
+my Q
+#
+#
+apl: runtime error -- DOMAIN ERROR: class has live instances; cannot redefine: Q
+     class Q defined.
+8
+1
+Lib.Stack
+DOMAIN ERROR: class has live instances: Lib.Stack
+1
+(no namespaces defined)

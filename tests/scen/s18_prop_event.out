@@ -1,0 +1,24 @@
+     R<-get
+     get defined.
+     set V;ok
+     set defined.
+     R<-get
+     get defined.
+     Init X
+     Init defined.
+     class Temp defined.
+212
+100
+0
+READONLY ERROR: property C has no set function
+     OnChange X
+     OnChange defined.
+     class Watcher defined.
+2
+100
+     Log X
+     Log defined.
+changed to 0
+3
+DOMAIN ERROR: no such event: Nope
+DOMAIN ERROR: no such event: Nope

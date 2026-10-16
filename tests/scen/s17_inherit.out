@@ -1,0 +1,52 @@
+     interface IShape defined.
+     R<-Name
+     Name defined.
+     R<-Area
+     Area defined.
+     R<-Describe
+     Describe defined.
+     class Shape defined.
+     R<-Area
+     Area defined.
+     R<-Name
+     Name defined.
+     class Rect defined.
+rect area 6
+30
+shape area 0
+1
+1
+0
+1
+     Init X
+     Init defined.
+     R<-Show
+     Show defined.
+     Bye
+     Bye defined.
+     class Base defined.
+     Init2 X
+     Init2 defined.
+     R<-Show
+     Show defined.
+     Bye2
+     Bye2 defined.
+     class Derived defined.
+derived 50 / base 5
+5
+derived destroyed
+base destroyed
+after
+Base Derived(:Base) Rect(:Shape) Shape
+     interface IFull defined.
+apl: runtime error -- INTERFACE ERROR: NoRun must have a public method Run
+apl: class NoRun was not completed and has been removed
+     R<-Area
+     Area defined.
+apl: runtime error -- METHOD ERROR: base method overridden without :Override: Area
+apl: class Shadow was not completed and has been removed
+     R<-Ghost
+     Ghost defined.
+apl: runtime error -- METHOD ERROR: :Override but no base method to override: Ghost
+apl: class Lonely was not completed and has been removed
+Base Derived(:Base) Rect(:Shape) Shape
