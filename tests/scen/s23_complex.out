@@ -1,0 +1,65 @@
+3J4
+5
+3J-4
+-3J-4
+4J3
+-7J24
+3.5J0.5
+0.6J0.8
+0J-1
+0J2
+1J1.732051
+0.540302J0.841471
+0J3.141593
+2J1.4298
+1 2J3 4
+2 4J6 8
+3
+1
+1
+0
+3
+5
+4
+0.785398
+1.298458J0.634964
+1.543081
+1.570796J1.316958
+0J-1.316958
+0J0.549306
+0J0.866025
+0J1.732051
+1.609438J3.141593
+3J-2 2 1J1
+2
+1J1 7J7 3J-2
+1J1 2    3
+  4 5 6J-1
+1J1 4
+  2 5
+  3 6
+11J6
+1J1 0J14 28J42
+1.414214 9.899495 3.605551
+2J2
+6J2    10
+ 15 21J-8
+6J2    10
+ 15 21J-8
+1J1
+1
+0
+1J1 2
+2
+DOMAIN ERROR: < does not accept a complex value (complex numbers have no or
+DOMAIN ERROR: floor does not accept a complex value
+DOMAIN ERROR: gradeup does not accept a complex value (complex numbers have no or
+DOMAIN ERROR: divide by zero
+DOMAIN ERROR: number out of range
+4J6
+3J4
+saved 3 variable(s) and 0 function(s) to s23ws.apl
+workspace cleared.
+loaded s23ws.apl
+1J1 7J7 3J-2
+3J4

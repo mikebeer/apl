@@ -379,6 +379,12 @@ static Arr *op_reduce(const FnRef *f, Arr *x, int ax)
   int k, outer, len, inner, o, j, i, sh[MAXRANK], rank, m;
   Arr *r;
   if (x->rank == 0) return a_ref(x);
+  if (x->type == T_CPX) {                 /* complex: item by item */
+    Arr *nx = a_to_nest(x);
+    r = op_reduce(f, nx, ax);
+    a_rel(nx);
+    return r;
+  }
   k = axis_pick(x, ax, P_REDUCE);
   axis_dims(x, k, &outer, &len, &inner);
   rank = x->rank - 1;
@@ -422,6 +428,12 @@ static Arr *op_scan(const FnRef *f, Arr *x, int ax)
   int k, outer, len, inner, o, j, i, q;
   Arr *r;
   if (x->rank == 0) return a_ref(x);
+  if (x->type == T_CPX) {
+    Arr *nx = a_to_nest(x);
+    r = op_scan(f, nx, ax);
+    a_rel(nx);
+    return r;
+  }
   k = axis_pick(x, ax, P_SCAN);
   axis_dims(x, k, &outer, &len, &inner);
   if (x->type == T_NEST) {
@@ -479,7 +491,7 @@ static Arr *op_outer(const FnRef *f, Arr *x, Arr *y)
   for (i = 0; i < x->rank; i++) sh[i] = x->shape[i];
   for (j = 0; j < y->rank; j++) sh[x->rank + j] = y->shape[j];
   if (x->type == T_NEST || y->type == T_NEST || x->type == T_CHR ||
-      y->type == T_CHR) {
+      y->type == T_CHR || x->type == T_CPX || y->type == T_CPX) {
     r = a_new(T_NEST, rank, sh);
     k = 0;
     for (i = 0; i < x->n; i++) {
@@ -923,13 +935,18 @@ static Arr *member_access(Ps *p, Arr *obj, int allow_args, Fn **mfn)
   return res;
 }
 
+/* selective assignment:  (selection v) <- value
+ * While the selection is evaluated, the token sel_tok stands for an array of
+ * positions 1..n shaped like the variable instead of its value; whatever the
+ * selection leaves are the positions to assign.  A 0 is a fill item. */
+
 static Arr *parse_item0(Ps *p)
 {
   Tok *t = &p->t[p->i];
   Arr *a;
   if (t->k == K_NUM) {
     p->i++;
-    return a_scalar(t->num);
+    return a_cscalar(t->num, t->im);
   }
   if (t->k == K_STR) {
     int n = (int)strlen(t->s);
@@ -964,8 +981,13 @@ static Arr *parse_item0(Ps *p)
     return quad_value(t->s);
   }
   if (t->k == K_NAME) {
-    Fn *u = fn_find(t->s);
+    Fn *u;
     Arr *v;
+    if (t == sel_tok && sel_idx) {          /* selective assignment: positions */
+      p->i++;
+      return a_ref(sel_idx);
+    }
+    u = fn_find(t->s);
     if (u) {
       if (u->arity != 0) syn_error_s("missing argument for function: ", t->s);
       p->i++;
@@ -1037,10 +1059,14 @@ static Arr *parse_item(Ps *p)
   Arr *a;
   if (p->t[p->i].k == K_NUM) {
     int n = 0, i;
-    while (p->t[p->i + n].k == K_NUM) n++;
+    int cx = 0;
+    while (p->t[p->i + n].k == K_NUM) { if (p->t[p->i + n].im != 0.0) cx = 1; n++; }
     if (n > 1 && tok_sym(&p->t[p->i + n], "[")) {
-      a = a_vec(T_NUM, n);
-      for (i = 0; i < n; i++) a->num[i] = p->t[p->i + i].num;
+      a = a_vec(cx ? T_CPX : T_NUM, n);
+      for (i = 0; i < n; i++) {
+        a->num[i] = p->t[p->i + i].num;
+        if (cx) a->im[i] = p->t[p->i + i].im;
+      }
       p->i += n;
     } else a = parse_item0(p);
   } else a = parse_item0(p);
@@ -1087,6 +1113,7 @@ static Arr *build_strand(Arr **it, int n)
   } else {
     r = a_vec(T_NEST, n);
     for (i = 0; i < n; i++) a_put(r, i, it[i]);
+    r = a_simplify(r);      /* real and complex scalars make a complex vector */
   }
   return r;
 }
@@ -1531,6 +1558,82 @@ static void assign_check(const char *name)
     syn_error_s("name is already a function: ", name);
 }
 
+static int sel_word_ok(const char *w)
+{
+  static const char *ok[] = { "take", "drop", "reverse", "rotate", "transpose",
+    "ravel", "compress", "expand", "pick", "first", "disclose", "mix", "rho",
+    "index", "zilch", NULL };
+  int i;
+  for (i = 0; ok[i]; i++) if (strcmp(w, ok[i]) == 0) return 1;
+  return 0;
+}
+
+static void sel_assign(Tok *t, int e)
+{
+  Ps p;
+  int i, d = 0, k = -1;
+  Arr *cur, *idx, *pos, *val, *r, *base, *v;
+  char *name;
+  /* only structural functions at the top level of the selection */
+  for (i = 1; i < e; i++) {
+    if (tok_sym(&t[i], "(") || tok_sym(&t[i], "[")) { d++; continue; }
+    if (tok_sym(&t[i], ")") || tok_sym(&t[i], "]")) { d--; continue; }
+    if (d != 0) continue;
+    if (t[i].k == K_SYM && !tok_sym(&t[i], ";"))
+      rt_error("DOMAIN ERROR: selective assignment: only structural functions can select");
+    if (t[i].k == K_NAME) {
+      if (prim_lookup(t[i].s) || strcmp(t[i].s, "zilch") == 0) {
+        if (!sel_word_ok(t[i].s))
+          rt_error("DOMAIN ERROR: selective assignment: only structural functions can select");
+      } else if (!fn_find(t[i].s) && var_get(t[i].s)) k = i;
+    }
+  }
+  if (k < 0) syn_error("selective assignment needs a variable to select from");
+  name = t[k].s;
+  assign_check(name);
+  cur = var_get(name);
+  if (cur->type == T_NEST && cur->rank == 0)
+    rt_error("DOMAIN ERROR: selective assignment: cannot select from an enclosed value");
+  idx = a_new(T_NUM, cur->rank, cur->shape);
+  for (i = 0; i < idx->n; i++) idx->num[i] = (double)(i + 1);
+  sel_tok = &t[k]; sel_idx = idx;
+  p.t = t; p.i = 1;
+  pos = parse_expr(&p);               /* an error leaves sel_tok set: reset below */
+  sel_tok = NULL; sel_idx = NULL;
+  a_rel(idx);
+  if (!pos) syn_error("selection returned no value");
+  if (p.i != e) { a_rel(pos); unexpected(&p.t[p.i]); }
+  p.i = e + 2;
+  val = need_val(parse_expr(&p));
+  if (p.t[p.i].k != K_END) { a_rel(pos); a_rel(val); unexpected(&p.t[p.i]); }
+  if (pos->type != T_NUM) {
+    a_rel(pos); a_rel(val);
+    rt_error("DOMAIN ERROR: selective assignment: the selection is not part of the variable");
+  }
+  if (val->n != 1 && (val->n != pos->n || (pos->rank > 0 && val->rank > 0 && !a_same_shape(pos, val)))) {
+    char buf[96];
+    sprintf(buf, "LENGTH ERROR: selective assignment %d / %d", val->n, pos->n);
+    a_rel(pos); a_rel(val);
+    rt_error(buf);
+  }
+  cur = var_get(name);
+  if (cur->type == val->type) { base = a_ref(cur); v = a_ref(val); }
+  else { base = a_to_nest(cur); v = a_to_nest(val); }
+  r = a_like(base, cur->rank, cur->shape);
+  for (i = 0; i < cur->n; i++) a_copyel(r, i, base, i);
+  a_rel(base);
+  for (i = 0; i < pos->n; i++) {
+    double q = pos->num[i];
+    if (q != floor(q) || q < 1.0 || q > (double)cur->n) {
+      a_rel(pos); a_rel(val); a_rel(v); a_rel(r);
+      rt_error("DOMAIN ERROR: selective assignment: the selection is not part of the variable");
+    }
+    a_copyel(r, (int)q - 1, v, v->n == 1 ? 0 : i);
+  }
+  a_rel(v); a_rel(pos); a_rel(val);
+  var_set(name, a_simplify(r));
+}
+
 static void exec_tokens(Tok *t)
 {
   Ps p;
@@ -1587,6 +1690,10 @@ static void exec_tokens(Tok *t)
     var_set(t[0].s, NULL);
     fn_install_here(nf);
     return;
+  }
+  if (tok_sym(&t[0], "(")) {
+    int e = paren_end(t, 0);
+    if (e > 0 && tok_sym(&t[e + 1], "<-")) { sel_assign(t, e); return; }
   }
   if (t[0].k == K_NAME && tok_sym(&t[1], "[")) {
     int d = 0, j = 1;
@@ -1685,6 +1792,10 @@ static int is_assignment(const Tok *t)
 {
   int d = 0, j = 1;
   if (t[0].k == K_END) return 0;
+  if (tok_sym(&t[0], "(")) {
+    int e = paren_end(t, 0);
+    return e > 0 && tok_sym(&t[e + 1], "<-");
+  }
   if ((t[0].k == K_NAME || t[0].k == K_QNAME || t[0].k == K_QUAD) &&
       tok_sym(&t[1], "<-")) return 1;
   if (t[0].k == K_NAME && tok_sym(&t[1], "[")) {
@@ -1722,10 +1833,10 @@ static Tok *tok_slice(const Tok *t, int a, int b)       /* [a, b) */
   Tok *r = (Tok *)xmalloc(sizeof(Tok) * (size_t)(n + 1));
   for (i = 0; i < n; i++) {
     r[i].k = t[a + i].k;
-    r[i].num = t[a + i].num;
+    r[i].num = t[a + i].num; r[i].im = t[a + i].im;
     r[i].s = t[a + i].s ? xstrdup(t[a + i].s) : NULL;
   }
-  r[n].k = K_END; r[n].num = 0; r[n].s = NULL;
+  r[n].k = K_END; r[n].num = 0; r[n].im = 0; r[n].s = NULL;
   return r;
 }
 
@@ -1742,7 +1853,10 @@ static char *tok_src(const Tok *t, int a, int b)
     char *tmp = NULL;
     size_t pl;
     switch (t[i].k) {
-    case K_NUM: sprintf(buf, "%.17g", t[i].num); break;
+    case K_NUM:
+      if (t[i].im != 0.0) sprintf(buf, "%.17gJ%.17g", t[i].num, t[i].im);
+      else sprintf(buf, "%.17g", t[i].num);
+      break;
     case K_NAME: case K_SYM: piece = t[i].s; break;
     case K_QUAD: piece = "[]"; break;
     case K_QNAME:
@@ -1898,11 +2012,11 @@ static Arr *apply_userop(Ps *p, Fn *u, Arr *left)
     else if (tok_name(&u->optok[i], "omegaomega")) { a = gs; b = ge; }
     if (a >= 0) {
       for (j = a; j < b; j++) {
-        q->k = p->t[j].k; q->num = p->t[j].num;
+        q->k = p->t[j].k; q->num = p->t[j].num; q->im = p->t[j].im;
         q->s = p->t[j].s ? xstrdup(p->t[j].s) : NULL; q++;
       }
     } else {
-      q->k = u->optok[i].k; q->num = u->optok[i].num;
+      q->k = u->optok[i].k; q->num = u->optok[i].num; q->im = u->optok[i].im;
       q->s = u->optok[i].s ? xstrdup(u->optok[i].s) : NULL; q++;
     }
   }

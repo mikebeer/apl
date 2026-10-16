@@ -1,0 +1,31 @@
+0 0 3 4 5 6
+0 0 9 9 9 9
+60 50 40 30 20 10
+0 0 40 30 20 10
+0 0 0
+4 5 6
+7 8 9
+1 2 3
+4 5 6
+7 8 9
+0 0 0
+0 0 0
+0 0 0
+0
+99 0 40 30 20 10
+99 0 40 30 7 8
+5 6 1 2 3 4
+Jello
+5 5 l l o
+5 6 33 2 3 4
+DOMAIN ERROR: selective assignment: only structural functions can select
+DOMAIN ERROR: selective assignment: the selection is not part of the variable
+LENGTH ERROR: selective assignment 3 / 2
+selective assignment needs a variable to select from
+a b 3 4 5 6
+     Z<-CLIP V
+     CLIP defined.
+     Z<-ZAP V
+     ZAP defined.
+0 6 7
+4 0 0

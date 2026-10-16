@@ -11,6 +11,7 @@
 #define T_NUM 0
 #define T_CHR 1
 #define T_NEST 2
+#define T_CPX 3                /* complex: num = real parts, im = imaginary */
 
 struct Scope;                  /* namespace / class / instance (p4b_oo.c) */
 
@@ -21,7 +22,8 @@ typedef struct Arr {
   int rank;
   int n;                       /* element count */
   int shape[MAXRANK];
-  double *num;                 /* T_NUM data */
+  double *num;                 /* T_NUM data, or the real parts of T_CPX */
+  double *im;                  /* T_CPX imaginary parts */
   char *chr;                   /* T_CHR data (n+1 bytes, NUL terminated) */
   struct Arr **sub;            /* T_NEST items */
   int mark;
@@ -49,12 +51,15 @@ static Arr *a_new(int type, int rank, const int *shape)
   for (i = 0; i < MAXRANK; i++) a->shape[i] = (i < rank) ? shape[i] : 0;
   a->n = shape_count(rank, shape);
   a->num = NULL;
+  a->im = NULL;
   a->chr = NULL;
   a->sub = NULL;
   a->mark = 0;
   a->obj = NULL;
-  if (type == T_NUM) {
+  if (type == T_NUM || type == T_CPX) {
     a->num = (double *)xmalloc(sizeof(double) * (size_t)a->n);
+    if (type == T_CPX)
+      a->im = (double *)xmalloc(sizeof(double) * (size_t)a->n);
   } else if (type == T_CHR) {
     a->chr = (char *)xmalloc((size_t)a->n + 1);
     a->chr[a->n] = '\0';
@@ -87,6 +92,7 @@ static void a_free(Arr *a)
     free(a->sub);
   }
   free(a->num);
+  free(a->im);
   free(a->chr);
   free(a);
 }
@@ -122,6 +128,15 @@ static Arr *a_str(const char *s)
   return a;
 }
 
+/* a complex scalar; a zero imaginary part gives an ordinary number */
+static Arr *a_cscalar(double re, double imv)
+{
+  Arr *a;
+  if (imv == 0.0) return a_scalar(re);
+  a = a_new(T_CPX, 0, NULL);
+  a->num[0] = re; a->im[0] = imv;
+  return a;
+}
 static int a_simple_scalar(const Arr *a)
 {
   return a->rank == 0 && a->type != T_NEST;
@@ -131,6 +146,7 @@ static int a_simple_scalar(const Arr *a)
 static Arr *a_item(const Arr *a, int i)
 {
   if (a->type == T_NUM) return a_scalar(a->num[i]);
+  if (a->type == T_CPX) return a_cscalar(a->num[i], a->im[i]);
   if (a->type == T_CHR) return a_char((unsigned char)a->chr[i]);
   return a_ref(a->sub[i]);
 }
@@ -146,12 +162,17 @@ static void a_put(Arr *d, int i, Arr *item)
 static void a_copyel(Arr *d, int di, const Arr *s, int si)
 {
   if (d->type == T_NUM) d->num[di] = s->num[si];
+  else if (d->type == T_CPX) {
+    d->num[di] = s->num[si];
+    d->im[di] = (s->type == T_CPX) ? s->im[si] : 0.0;
+  }
   else if (d->type == T_CHR) d->chr[di] = s->chr[si];
   else a_put(d, di, a_item(s, si));
 }
 static void a_fill(Arr *d, int di)       /* prototype fill: 0 or blank */
 {
   if (d->type == T_NUM) d->num[di] = 0.0;
+  else if (d->type == T_CPX) { d->num[di] = 0.0; d->im[di] = 0.0; }
   else if (d->type == T_CHR) d->chr[di] = ' ';
   else {
     int blank = 0;
@@ -193,12 +214,21 @@ static Arr *a_simplify(Arr *a)
     Arr *s = a->sub[i];
     if (!s || !a_simple_scalar(s)) return a;
     if (t < 0) t = s->type;
-    else if (t != s->type) return a;
+    else if (t != s->type) {
+      /* real and complex numbers mix into a complex array */
+      if ((t == T_NUM || t == T_CPX) && (s->type == T_NUM || s->type == T_CPX))
+        t = T_CPX;
+      else return a;
+    }
   }
   if (t < 0) t = T_NUM;                 /* empty: numeric */
   r = a_new(t, a->rank, a->shape);
   for (i = 0; i < a->n; i++) {
     if (t == T_NUM) r->num[i] = a->sub[i]->num[0];
+    else if (t == T_CPX) {
+      r->num[i] = a->sub[i]->num[0];
+      r->im[i] = (a->sub[i]->type == T_CPX) ? a->sub[i]->im[0] : 0.0;
+    }
     else r->chr[i] = a->sub[i]->chr[0];
   }
   a_rel(a);
@@ -211,9 +241,11 @@ static int a_match(const Arr *a, const Arr *b)
   int i;
   if (!a_same_shape(a, b)) return 0;
   if (a->type != T_NEST && b->type == a->type) {
-    for (i = 0; i < a->n; i++)
-      if (a->type == T_NUM ? a->num[i] != b->num[i] : a->chr[i] != b->chr[i])
-        return 0;
+    for (i = 0; i < a->n; i++) {
+      if (a->type == T_CHR) { if (a->chr[i] != b->chr[i]) return 0; }
+      else if (a->num[i] != b->num[i]) return 0;
+      else if (a->type == T_CPX && a->im[i] != b->im[i]) return 0;
+    }
     return 1;
   }
   if (a->type != T_NEST && b->type != T_NEST) return a->n == 0 && b->n == 0;
@@ -262,7 +294,7 @@ static void sweep_unmarked(void)
     if (!a->mark) {
       a_unlink(a);
       if (a->obj) obj_release(a->obj);
-      free(a->sub); free(a->num); free(a->chr); free(a);
+      free(a->sub); free(a->num); free(a->im); free(a->chr); free(a);
     } else a->mark = 0;
     a = nx;
   }
@@ -288,6 +320,18 @@ static void fmt_num(double x, char *buf)
     if (*p == '.') *p = '\0';
   }
   if (strcmp(buf, "-0") == 0) strcpy(buf, "0");
+}
+
+/* element i of a numeric array as text; a complex number is aJb */
+static void fmt_elem(const Arr *a, int i, char *buf)
+{
+  if (a->type == T_CPX && a->im[i] != 0.0) {
+    char t[64];
+    fmt_num(a->num[i], buf);
+    strcat(buf, "J");
+    fmt_num(a->im[i], t);
+    strcat(buf, t);
+  } else fmt_num(a->num[i], buf);
 }
 
 /* ---- display: rendered as blocks of text lines ---- */
@@ -370,12 +414,12 @@ static Blk *blk_planes(Blk **pl, int np, const Arr *a)
 
 static Blk *render_simple(const Arr *a)
 {
-  char buf[64];
+  char buf[128];
   int i, r, c, k, rows, cols, plane, np, p;
   Blk **pl;
   if (a->rank == 0) {
     if (a->type == T_CHR) { buf[0] = a->chr[0]; buf[1] = '\0'; }
-    else fmt_num(a->num[0], buf);
+    else fmt_elem(a, 0, buf);
     return blk_text(buf);
   }
   if (a->rank == 1) {
@@ -384,13 +428,13 @@ static Blk *render_simple(const Arr *a)
       memcpy(b->ln[0], a->chr, (size_t)a->n);
       return b;
     } else {
-      char *s = (char *)xmalloc((size_t)a->n * 40 + 2);
+      char *s = (char *)xmalloc((size_t)a->n * 80 + 2);
       Blk *b;
       s[0] = '\0';
       k = 0;
       for (i = 0; i < a->n; i++) {
         if (i) s[k++] = ' ';
-        fmt_num(a->num[i], buf);
+        fmt_elem(a, i, buf);
         strcpy(s + k, buf);
         k += (int)strlen(buf);
       }
@@ -419,7 +463,7 @@ static Blk *render_simple(const Arr *a)
       for (r = 0; r < rows; r++)
         for (c = 0; c < cols; c++) {
           int len;
-          fmt_num(a->num[p * plane + r * cols + c], buf);
+          fmt_elem(a, p * plane + r * cols + c, buf);
           cell[r * cols + c] = xstrdup(buf);
           len = (int)strlen(buf);
           if (len > w[c]) w[c] = len;
@@ -456,7 +500,7 @@ static Blk *render_nest(const Arr *a)
   for (i = 0; i < a->n; i++) {
     Arr *it = a->sub[i];
     cell[i] = render(it);
-    right[i] = (it->rank == 0 && it->type == T_NUM);
+    right[i] = (it->rank == 0 && (it->type == T_NUM || it->type == T_CPX));
     if (!a_simple_scalar(it)) cell[i] = blk_pad(cell[i]);
   }
   cols = a->shape[a->rank - 1];

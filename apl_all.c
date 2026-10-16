@@ -138,6 +138,7 @@ static int interactive = 0;   /* 1 when reading a terminal REPL */
 #define T_NUM 0
 #define T_CHR 1
 #define T_NEST 2
+#define T_CPX 3                /* complex: num = real parts, im = imaginary */
 
 struct Scope;                  /* namespace / class / instance (p4b_oo.c) */
 
@@ -148,7 +149,8 @@ typedef struct Arr {
   int rank;
   int n;                       /* element count */
   int shape[MAXRANK];
-  double *num;                 /* T_NUM data */
+  double *num;                 /* T_NUM data, or the real parts of T_CPX */
+  double *im;                  /* T_CPX imaginary parts */
   char *chr;                   /* T_CHR data (n+1 bytes, NUL terminated) */
   struct Arr **sub;            /* T_NEST items */
   int mark;
@@ -176,12 +178,15 @@ static Arr *a_new(int type, int rank, const int *shape)
   for (i = 0; i < MAXRANK; i++) a->shape[i] = (i < rank) ? shape[i] : 0;
   a->n = shape_count(rank, shape);
   a->num = NULL;
+  a->im = NULL;
   a->chr = NULL;
   a->sub = NULL;
   a->mark = 0;
   a->obj = NULL;
-  if (type == T_NUM) {
+  if (type == T_NUM || type == T_CPX) {
     a->num = (double *)xmalloc(sizeof(double) * (size_t)a->n);
+    if (type == T_CPX)
+      a->im = (double *)xmalloc(sizeof(double) * (size_t)a->n);
   } else if (type == T_CHR) {
     a->chr = (char *)xmalloc((size_t)a->n + 1);
     a->chr[a->n] = '\0';
@@ -214,6 +219,7 @@ static void a_free(Arr *a)
     free(a->sub);
   }
   free(a->num);
+  free(a->im);
   free(a->chr);
   free(a);
 }
@@ -249,6 +255,15 @@ static Arr *a_str(const char *s)
   return a;
 }
 
+/* a complex scalar; a zero imaginary part gives an ordinary number */
+static Arr *a_cscalar(double re, double imv)
+{
+  Arr *a;
+  if (imv == 0.0) return a_scalar(re);
+  a = a_new(T_CPX, 0, NULL);
+  a->num[0] = re; a->im[0] = imv;
+  return a;
+}
 static int a_simple_scalar(const Arr *a)
 {
   return a->rank == 0 && a->type != T_NEST;
@@ -258,6 +273,7 @@ static int a_simple_scalar(const Arr *a)
 static Arr *a_item(const Arr *a, int i)
 {
   if (a->type == T_NUM) return a_scalar(a->num[i]);
+  if (a->type == T_CPX) return a_cscalar(a->num[i], a->im[i]);
   if (a->type == T_CHR) return a_char((unsigned char)a->chr[i]);
   return a_ref(a->sub[i]);
 }
@@ -273,12 +289,17 @@ static void a_put(Arr *d, int i, Arr *item)
 static void a_copyel(Arr *d, int di, const Arr *s, int si)
 {
   if (d->type == T_NUM) d->num[di] = s->num[si];
+  else if (d->type == T_CPX) {
+    d->num[di] = s->num[si];
+    d->im[di] = (s->type == T_CPX) ? s->im[si] : 0.0;
+  }
   else if (d->type == T_CHR) d->chr[di] = s->chr[si];
   else a_put(d, di, a_item(s, si));
 }
 static void a_fill(Arr *d, int di)       /* prototype fill: 0 or blank */
 {
   if (d->type == T_NUM) d->num[di] = 0.0;
+  else if (d->type == T_CPX) { d->num[di] = 0.0; d->im[di] = 0.0; }
   else if (d->type == T_CHR) d->chr[di] = ' ';
   else {
     int blank = 0;
@@ -320,12 +341,21 @@ static Arr *a_simplify(Arr *a)
     Arr *s = a->sub[i];
     if (!s || !a_simple_scalar(s)) return a;
     if (t < 0) t = s->type;
-    else if (t != s->type) return a;
+    else if (t != s->type) {
+      /* real and complex numbers mix into a complex array */
+      if ((t == T_NUM || t == T_CPX) && (s->type == T_NUM || s->type == T_CPX))
+        t = T_CPX;
+      else return a;
+    }
   }
   if (t < 0) t = T_NUM;                 /* empty: numeric */
   r = a_new(t, a->rank, a->shape);
   for (i = 0; i < a->n; i++) {
     if (t == T_NUM) r->num[i] = a->sub[i]->num[0];
+    else if (t == T_CPX) {
+      r->num[i] = a->sub[i]->num[0];
+      r->im[i] = (a->sub[i]->type == T_CPX) ? a->sub[i]->im[0] : 0.0;
+    }
     else r->chr[i] = a->sub[i]->chr[0];
   }
   a_rel(a);
@@ -338,9 +368,11 @@ static int a_match(const Arr *a, const Arr *b)
   int i;
   if (!a_same_shape(a, b)) return 0;
   if (a->type != T_NEST && b->type == a->type) {
-    for (i = 0; i < a->n; i++)
-      if (a->type == T_NUM ? a->num[i] != b->num[i] : a->chr[i] != b->chr[i])
-        return 0;
+    for (i = 0; i < a->n; i++) {
+      if (a->type == T_CHR) { if (a->chr[i] != b->chr[i]) return 0; }
+      else if (a->num[i] != b->num[i]) return 0;
+      else if (a->type == T_CPX && a->im[i] != b->im[i]) return 0;
+    }
     return 1;
   }
   if (a->type != T_NEST && b->type != T_NEST) return a->n == 0 && b->n == 0;
@@ -389,7 +421,7 @@ static void sweep_unmarked(void)
     if (!a->mark) {
       a_unlink(a);
       if (a->obj) obj_release(a->obj);
-      free(a->sub); free(a->num); free(a->chr); free(a);
+      free(a->sub); free(a->num); free(a->im); free(a->chr); free(a);
     } else a->mark = 0;
     a = nx;
   }
@@ -415,6 +447,18 @@ static void fmt_num(double x, char *buf)
     if (*p == '.') *p = '\0';
   }
   if (strcmp(buf, "-0") == 0) strcpy(buf, "0");
+}
+
+/* element i of a numeric array as text; a complex number is aJb */
+static void fmt_elem(const Arr *a, int i, char *buf)
+{
+  if (a->type == T_CPX && a->im[i] != 0.0) {
+    char t[64];
+    fmt_num(a->num[i], buf);
+    strcat(buf, "J");
+    fmt_num(a->im[i], t);
+    strcat(buf, t);
+  } else fmt_num(a->num[i], buf);
 }
 
 /* ---- display: rendered as blocks of text lines ---- */
@@ -497,12 +541,12 @@ static Blk *blk_planes(Blk **pl, int np, const Arr *a)
 
 static Blk *render_simple(const Arr *a)
 {
-  char buf[64];
+  char buf[128];
   int i, r, c, k, rows, cols, plane, np, p;
   Blk **pl;
   if (a->rank == 0) {
     if (a->type == T_CHR) { buf[0] = a->chr[0]; buf[1] = '\0'; }
-    else fmt_num(a->num[0], buf);
+    else fmt_elem(a, 0, buf);
     return blk_text(buf);
   }
   if (a->rank == 1) {
@@ -511,13 +555,13 @@ static Blk *render_simple(const Arr *a)
       memcpy(b->ln[0], a->chr, (size_t)a->n);
       return b;
     } else {
-      char *s = (char *)xmalloc((size_t)a->n * 40 + 2);
+      char *s = (char *)xmalloc((size_t)a->n * 80 + 2);
       Blk *b;
       s[0] = '\0';
       k = 0;
       for (i = 0; i < a->n; i++) {
         if (i) s[k++] = ' ';
-        fmt_num(a->num[i], buf);
+        fmt_elem(a, i, buf);
         strcpy(s + k, buf);
         k += (int)strlen(buf);
       }
@@ -546,7 +590,7 @@ static Blk *render_simple(const Arr *a)
       for (r = 0; r < rows; r++)
         for (c = 0; c < cols; c++) {
           int len;
-          fmt_num(a->num[p * plane + r * cols + c], buf);
+          fmt_elem(a, p * plane + r * cols + c, buf);
           cell[r * cols + c] = xstrdup(buf);
           len = (int)strlen(buf);
           if (len > w[c]) w[c] = len;
@@ -583,7 +627,7 @@ static Blk *render_nest(const Arr *a)
   for (i = 0; i < a->n; i++) {
     Arr *it = a->sub[i];
     cell[i] = render(it);
-    right[i] = (it->rank == 0 && it->type == T_NUM);
+    right[i] = (it->rank == 0 && (it->type == T_NUM || it->type == T_CPX));
     if (!a_simple_scalar(it)) cell[i] = blk_pad(cell[i]);
   }
   cols = a->shape[a->rank - 1];
@@ -661,6 +705,7 @@ static void show(const Arr *a)
 typedef struct Tok {
   int k;
   double num;
+  double im;                   /* imaginary part of a literal 3J4 */
   char *s;
 } Tok;
 
@@ -730,7 +775,7 @@ static Tok *lex(const char *line)
   const char *p = line;
   while (1) {
     int k = K_END, len = 0;
-    double v = 0.0;
+    double v = 0.0, vi = 0.0;
     char *s = NULL;
     while (is_space((unsigned char)*p)) p++;
     if (*p == '\0' || *p == '#') break;
@@ -762,6 +807,18 @@ static Tok *lex(const char *line)
       if (neg) v = -v;
       k = K_NUM;
       p = b + len;
+      /* complex literal  aJb  /  aJ-b */
+      if ((*p == 'J' || *p == 'j') &&
+          (num_start(p + 1) || (p[1] == '-' && num_start(p + 2)))) {
+        int ineg = (p[1] == '-');
+        const char *c = p + 1 + ineg;
+        int cl = num_len(c);
+        char *t2 = xstrndup(c, cl);
+        vi = strtod(t2, NULL);
+        free(t2);
+        if (ineg) vi = -vi;
+        p = c + cl;
+      }
     } else if (*p == '\'') {
       const char *q = p + 1;
       int m = 0;
@@ -827,11 +884,11 @@ static Tok *lex(const char *line)
       cap *= 2;
       t = (Tok *)xrealloc(t, sizeof(Tok) * (size_t)cap);
     }
-    t[n].k = k; t[n].num = v; t[n].s = s;
+    t[n].k = k; t[n].num = v; t[n].im = vi; t[n].s = s;
     n++;
-    t[n].k = K_END; t[n].s = NULL; t[n].num = 0;
+    t[n].k = K_END; t[n].s = NULL; t[n].num = 0; t[n].im = 0;
   }
-  t[n].k = K_END; t[n].s = NULL; t[n].num = 0;
+  t[n].k = K_END; t[n].s = NULL; t[n].num = 0; t[n].im = 0;
   return t;
 }
 
@@ -842,8 +899,13 @@ static Tok *lex_t(const char *line)
   trk_add(t, 1);
   return t;
 }
+/* selective assignment in progress (p4_eval.c); cleared when an error unwinds */
+static const Tok *sel_tok = NULL;
+static Arr *sel_idx = NULL;
+
 static void trk_unwind(int mark)
 {
+  sel_tok = NULL; sel_idx = NULL;
   while (ntrk > mark) {
     Trk e = trk[--ntrk];
     if (e.is_tok) {
@@ -964,6 +1026,9 @@ static void need_num(const Arr *a, int id)
   if (a->type == T_NEST)
     rt_error_s("DOMAIN ERROR: ", prim_name(id),
                " does not accept a nested value");
+  if (a->type == T_CPX)
+    rt_error_s("DOMAIN ERROR: ", prim_name(id),
+               " does not accept a complex value");
   if (a->type != T_NUM)
     rt_error_s("DOMAIN ERROR: ", prim_name(id),
                " does not accept a text value");
@@ -1180,6 +1245,258 @@ static double chk_num(double v)
 static double sdya(int id, double a, double b) { return chk_num(sdya0(id, a, b)); }
 static double smon(int id, double a) { return chk_num(smon0(id, a)); }
 
+
+/* ---------- complex numbers ---------- */
+typedef struct Cx { double re, im; } Cx;
+
+static Cx cx_of(double re, double im) { Cx z; z.re = re; z.im = im; return z; }
+static Cx cx_get(const Arr *a, int i)
+{
+  Cx z;
+  z.re = a->num[i];
+  z.im = (a->type == T_CPX) ? a->im[i] : 0.0;
+  return z;
+}
+static double cx_abs(Cx z) { return hypot(z.re, z.im); }
+static Cx cx_add(Cx a, Cx b) { return cx_of(a.re + b.re, a.im + b.im); }
+static Cx cx_sub(Cx a, Cx b) { return cx_of(a.re - b.re, a.im - b.im); }
+static Cx cx_mul(Cx a, Cx b)
+{
+  return cx_of(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re);
+}
+static Cx cx_div(Cx a, Cx b)
+{
+  double d;
+  if (b.re == 0.0 && b.im == 0.0) {
+    if (a.re == 0.0 && a.im == 0.0) return cx_of(1.0, 0.0);
+    rt_error("DOMAIN ERROR: divide by zero");
+  }
+  /* Smith's algorithm: no overflow for large parts */
+  if (fabs(b.re) >= fabs(b.im)) {
+    double r = b.im / b.re;
+    d = b.re + b.im * r;
+    return cx_of((a.re + a.im * r) / d, (a.im - a.re * r) / d);
+  } else {
+    double r = b.re / b.im;
+    d = b.re * r + b.im;
+    return cx_of((a.re * r + a.im) / d, (a.im * r - a.re) / d);
+  }
+}
+/* remove rounding dust: a part that is tiny next to the other is zero */
+static Cx cx_clean(Cx z)
+{
+  double m = fabs(z.re) > fabs(z.im) ? fabs(z.re) : fabs(z.im);
+  if (fabs(z.im) <= 1e-14 * m) z.im = 0.0;
+  if (fabs(z.re) <= 1e-14 * m) z.re = 0.0;
+  return z;
+}
+static Cx cx_sqrt(Cx z)
+{
+  double m = cx_abs(z), t, u;
+  if (m == 0.0) return cx_of(0.0, 0.0);
+  t = sqrt((m + fabs(z.re)) * 0.5);
+  u = z.im / (2.0 * t);
+  if (z.re >= 0.0) return cx_of(t, u);
+  return cx_of(fabs(u), z.im >= 0.0 ? t : -t);
+}
+static Cx cx_exp(Cx z)
+{
+  double e = exp(z.re);
+  return cx_clean(cx_of(e * cos(z.im), e * sin(z.im)));
+}
+static Cx cx_ln(Cx z)
+{
+  if (z.re == 0.0 && z.im == 0.0) rt_error("DOMAIN ERROR: ln of zero");
+  return cx_of(log(cx_abs(z)), atan2(z.im, z.re));
+}
+static Cx cx_pow(Cx a, Cx b)
+{
+  if (a.re == 0.0 && a.im == 0.0) {
+    if (b.re == 0.0 && b.im == 0.0) return cx_of(1.0, 0.0);
+    if (b.re <= 0.0) rt_error("DOMAIN ERROR: power: zero to a non-positive power");
+    return cx_of(0.0, 0.0);
+  }
+  /* small whole exponents by multiplication: exact */
+  if (b.im == 0.0 && b.re == floor(b.re) && fabs(b.re) <= 64.0) {
+    int n = (int)fabs(b.re), k;
+    Cx r = cx_of(1.0, 0.0);
+    for (k = 0; k < n; k++) r = cx_mul(r, a);
+    return b.re < 0.0 ? cx_div(cx_of(1.0, 0.0), r) : r;
+  }
+  if (b.im == 0.0 && b.re == 0.5) return cx_sqrt(a);
+  return cx_exp(cx_mul(b, cx_ln(a)));
+}
+static Cx cx_sin(Cx z)
+{ return cx_of(sin(z.re) * cosh(z.im), cos(z.re) * sinh(z.im)); }
+static Cx cx_cos(Cx z)
+{ return cx_of(cos(z.re) * cosh(z.im), -sin(z.re) * sinh(z.im)); }
+static Cx cx_sinh(Cx z)
+{ return cx_of(sinh(z.re) * cos(z.im), cosh(z.re) * sin(z.im)); }
+static Cx cx_cosh(Cx z)
+{ return cx_of(cosh(z.re) * cos(z.im), sinh(z.re) * sin(z.im)); }
+
+static Cx cx_circle(int k, Cx z)
+{
+  Cx one = cx_of(1.0, 0.0), i1 = cx_of(0.0, 1.0), t;
+  switch (k) {
+  case 1: return cx_clean(cx_sin(z));
+  case 2: return cx_clean(cx_cos(z));
+  case 3: return cx_clean(cx_div(cx_sin(z), cx_cos(z)));
+  case 5: return cx_clean(cx_sinh(z));
+  case 6: return cx_clean(cx_cosh(z));
+  case 7: return cx_clean(cx_div(cx_sinh(z), cx_cosh(z)));
+  case 0: return cx_sqrt(cx_sub(one, cx_mul(z, z)));
+  case 4: return cx_sqrt(cx_sub(cx_mul(z, z), one));
+  case -4: return cx_sqrt(cx_sub(cx_mul(z, z), one));
+  case 9: return cx_of(z.re, 0.0);
+  case 10: return cx_of(cx_abs(z), 0.0);
+  case 11: return cx_of(z.im, 0.0);
+  case 12: return cx_of(atan2(z.im, z.re), 0.0);
+  case -1:  /* asin z = -i ln(iz + sqrt(1-z^2)) */
+    if (z.im == 0.0 && fabs(z.re) > 1.0)      /* on the cut: imaginary part > 0 */
+      return cx_of(z.re > 0.0 ? 1.5707963267948966 : -1.5707963267948966,
+                   log(fabs(z.re) + sqrt(z.re * z.re - 1.0)));
+    t = cx_ln(cx_add(cx_mul(i1, z), cx_sqrt(cx_sub(one, cx_mul(z, z)))));
+    return cx_clean(cx_of(t.im, -t.re));
+  case -2:  /* acos z = pi/2 - asin z */
+    t = cx_circle(-1, z);
+    return cx_clean(cx_of(1.5707963267948966 - t.re, -t.im));
+  case -3:  /* atan z = (ln(1+iz) - ln(1-iz)) / 2i */
+    t = cx_sub(cx_ln(cx_add(one, cx_mul(i1, z))), cx_ln(cx_sub(one, cx_mul(i1, z))));
+    return cx_clean(cx_of(t.im * 0.5, -t.re * 0.5));
+  case -5: return cx_clean(cx_ln(cx_add(z, cx_sqrt(cx_add(cx_mul(z, z), one)))));
+  case -6: return cx_clean(cx_ln(cx_add(z, cx_mul(cx_sqrt(cx_add(z, one)), cx_sqrt(cx_sub(z, one))))));
+  case -7:
+    t = cx_ln(cx_div(cx_add(one, z), cx_sub(one, z)));
+    return cx_clean(cx_of(t.re * 0.5, t.im * 0.5));
+  }
+  rt_error("DOMAIN ERROR: unknown circle function number for a complex value");
+  return one;
+}
+
+static void cx_chk(Cx z)
+{
+  (void)chk_num(z.re);
+  (void)chk_num(z.im);
+}
+
+/* would this real operation have a complex result? */
+static int real_to_cpx_mon(int id, double a)
+{
+  return id == P_LOG && a < 0.0;
+}
+static int real_to_cpx_dya(int id, double a, double b)
+{
+  switch (id) {
+  case P_POW: return a < 0.0 && b != floor(b);
+  case P_LOG: return (a < 0.0 || b < 0.0) && a != 1.0 && a != 0.0 && b != 0.0;
+  case P_CIRCLE:
+    if (a != floor(a)) return 0;
+    switch ((int)a) {
+    case 0: case -1: case -2: case -7: return fabs(b) > 1.0;
+    case 4: case -4: return b * b < 1.0;
+    case -6: return b < 1.0;
+    }
+  }
+  return 0;
+}
+
+static Cx cx_mon1(int id, Cx z)
+{
+  switch (id) {
+  case P_ADD: return cx_of(z.re, -z.im);
+  case P_SUB: return cx_of(-z.re, -z.im);
+  case P_MUL: {
+    double m = cx_abs(z);
+    return m == 0.0 ? cx_of(0.0, 0.0) : cx_of(z.re / m, z.im / m);
+  }
+  case P_DIV: return cx_div(cx_of(1.0, 0.0), z);
+  case P_POW: return cx_exp(z);
+  case P_LOG: return cx_ln(z);
+  case P_ABS: return cx_of(cx_abs(z), 0.0);
+  case P_CIRCLE: return cx_of(3.14159265358979323846 * z.re, 3.14159265358979323846 * z.im);
+  }
+  rt_error_s("DOMAIN ERROR: ", prim_name(id), " does not accept a complex value");
+  return z;
+}
+static int cx_eq(Cx a, Cx b) { return ct_eq(a.re, b.re) && ct_eq(a.im, b.im); }
+static Cx cx_dya1(int id, Cx a, Cx b)
+{
+  switch (id) {
+  case P_ADD: return cx_add(a, b);
+  case P_SUB: return cx_sub(a, b);
+  case P_MUL: return cx_mul(a, b);
+  case P_DIV: return cx_div(a, b);
+  case P_POW: return cx_pow(a, b);
+  case P_LOG:
+    if (a.re == 1.0 && a.im == 0.0) rt_error("DOMAIN ERROR: log base 1");
+    return cx_clean(cx_div(cx_ln(b), cx_ln(a)));
+  case P_EQ: return cx_of(cx_eq(a, b) ? 1.0 : 0.0, 0.0);
+  case P_NE: return cx_of(cx_eq(a, b) ? 0.0 : 1.0, 0.0);
+  case P_CIRCLE:
+    if (a.im != 0.0 || a.re != floor(a.re))
+      rt_error("DOMAIN ERROR: circle needs an integer function number");
+    return cx_circle((int)a.re, b);
+  }
+  rt_error_s("DOMAIN ERROR: ", prim_name(id),
+             " does not accept a complex value (complex numbers have no order)");
+  return a;
+}
+
+/* a T_CPX array whose imaginary parts are all zero becomes a T_NUM array */
+static Arr *cx_norm(Arr *r)
+{
+  int i;
+  Arr *q;
+  for (i = 0; i < r->n; i++) if (r->im[i] != 0.0) return r;
+  q = a_new(T_NUM, r->rank, r->shape);
+  for (i = 0; i < r->n; i++) q->num[i] = r->num[i];
+  a_rel(r);
+  return q;
+}
+
+static int any_to_cpx_mon(int id, const Arr *x)
+{
+  int i;
+  if (x->type != T_NUM) return 0;
+  for (i = 0; i < x->n; i++) if (real_to_cpx_mon(id, x->num[i])) return 1;
+  return 0;
+}
+static int any_to_cpx_dya(int id, const Arr *x, const Arr *y)
+{
+  int i, nx = x->rank == 0 ? 1 : x->n, ny = y->rank == 0 ? 1 : y->n;
+  int n = nx > ny ? nx : ny;
+  if (x->type != T_NUM || y->type != T_NUM) return 0;
+  if (x->rank != 0 && y->rank != 0 && x->n != y->n) return 0;
+  for (i = 0; i < n; i++)
+    if (real_to_cpx_dya(id, x->num[x->rank == 0 ? 0 : i], y->num[y->rank == 0 ? 0 : i]))
+      return 1;
+  return 0;
+}
+
+static Arr *cx_scalar_mon(int id, Arr *x)
+{
+  Arr *r = a_new(T_CPX, x->rank, x->shape);     /* arrays are reclaimed by the */
+  int i;                                        /* sweep if an error unwinds   */
+  for (i = 0; i < x->n; i++) {
+    Cx z = cx_mon1(id, cx_get(x, i));
+    cx_chk(z);
+    r->num[i] = z.re; r->im[i] = z.im;
+  }
+  return cx_norm(r);
+}
+static Arr *cx_scalar_dya(int id, Arr *x, Arr *y, int rank, const int *shp)
+{
+  int i;
+  Arr *r = a_new(T_CPX, rank, shp);
+  for (i = 0; i < r->n; i++) {
+    Cx z = cx_dya1(id, cx_get(x, x->rank == 0 ? 0 : i), cx_get(y, y->rank == 0 ? 0 : i));
+    cx_chk(z);
+    r->num[i] = z.re; r->im[i] = z.im;
+  }
+  return cx_norm(r);
+}
+
 static int is_scalar_dya(int id) { return id >= P_ADD && id <= P_NOR; }
 static int is_scalar_mon(int id)
 {
@@ -1202,6 +1519,7 @@ static Arr *scalar_mon(int id, Arr *x)
     }
     return a_simplify(r);
   }
+  if (x->type == T_CPX || any_to_cpx_mon(id, x)) return cx_scalar_mon(id, x);
   need_num(x, id);
   r = a_new(T_NUM, x->rank, x->shape);
   for (i = 0; i < x->n; i++) r->num[i] = smon(id, x->num[i]);
@@ -1237,6 +1555,23 @@ static Arr *scalar_dya(int id, Arr *x, Arr *y)
   }
   if (x->type == T_CHR || y->type == T_CHR) {
     if (id != P_EQ && id != P_NE) need_num(x->type == T_CHR ? x : y, id);
+  }
+  if (x->type == T_CPX || y->type == T_CPX || any_to_cpx_dya(id, x, y)) {
+    if (x->type == T_CHR || y->type == T_CHR) {
+      /* text against a complex number: equal never, not-equal always */
+      int rk = x->rank == 0 ? y->rank : x->rank;
+      const int *sh = x->rank == 0 ? y->shape : x->shape;
+      Arr *q = a_new(T_NUM, rk, sh);
+      for (i = 0; i < q->n; i++) q->num[i] = (id == P_NE) ? 1.0 : 0.0;
+      return q;
+    }
+    if (x->rank == 0) { shp = y->shape; rank = y->rank; }
+    else if (y->rank == 0) { shp = x->shape; rank = x->rank; }
+    else {
+      if (!a_same_shape(x, y)) rt_error("shape mismatch");
+      shp = x->shape; rank = x->rank;
+    }
+    return cx_scalar_dya(id, x, y, rank, shp);
   }
   if (x->rank == 0) { shp = y->shape; rank = y->rank; }
   else if (y->rank == 0) { shp = x->shape; rank = x->rank; }
@@ -1715,6 +2050,7 @@ static Arr *grade_p(Arr *coll, Arr *x, int desc)
   Arr *r;
   int id = desc ? P_GRADEDN : P_GRADEUP;
   if (x->type == T_NEST) rt_error_s("DOMAIN ERROR: ", prim_name(id), " does not accept a nested value");
+  if (x->type == T_CPX) rt_error_s("DOMAIN ERROR: ", prim_name(id), " does not accept a complex value (complex numbers have no order)");
   if (x->rank == 0) rt_error_s("RANK ERROR: ", prim_name(id), " needs an array");
   n = x->shape[0];
   g_sort = x;
@@ -2123,8 +2459,14 @@ static Arr *matmul_p(Arr *x, Arr *y)
 {
   int sh[MAXRANK], rank, k, m, n, i, j, l;
   Arr *r;
-  need_num(x, P_MATMUL);
-  need_num(y, P_MATMUL);
+  int cpx = (x->type == T_CPX || y->type == T_CPX);
+  if (cpx) {
+    if ((x->type != T_NUM && x->type != T_CPX) || (y->type != T_NUM && y->type != T_CPX))
+      need_num(x->type == T_CPX || x->type == T_NUM ? y : x, P_MATMUL);
+  } else {
+    need_num(x, P_MATMUL);
+    need_num(y, P_MATMUL);
+  }
   if (x->rank < 1 || y->rank < 1)
     rt_error("DOMAIN ERROR: matmul needs arrays, not scalars");
   k = x->shape[x->rank - 1];
@@ -2137,7 +2479,7 @@ static Arr *matmul_p(Arr *x, Arr *y)
   if (rank > MAXRANK) rt_error("RANK ERROR");
   for (i = 0; i < x->rank - 1; i++) sh[i] = x->shape[i];
   for (j = 1; j < y->rank; j++) sh[x->rank - 1 + j - 1] = y->shape[j];
-  r = a_new(T_NUM, rank, sh);
+  r = a_new(cpx ? T_CPX : T_NUM, rank, sh);
   m = (k > 0) ? x->n / k : 0;
   if (k == 0) {
     m = 1;
@@ -2147,6 +2489,18 @@ static Arr *matmul_p(Arr *x, Arr *y)
   if (k == 0) {
     n = 1;
     for (j = 1; j < y->rank; j++) n *= y->shape[j];
+  }
+  if (cpx) {
+    for (i = 0; i < m; i++)
+      for (j = 0; j < n; j++) {
+        Cx s = cx_of(0.0, 0.0);
+        for (l = 0; l < k; l++)
+          s = cx_add(s, cx_mul(cx_get(x, i * k + l), cx_get(y, l * n + j)));
+        cx_chk(s);
+        r->num[i * n + j] = s.re;
+        r->im[i * n + j] = s.im;
+      }
+    return cx_norm(r);
   }
   for (i = 0; i < m; i++)
     for (j = 0; j < n; j++) {
@@ -2893,6 +3247,551 @@ static void ap_init(void)
   ap_register(126, "AP126", 0, NULL, NULL, NULL, NULL);
   ap_register(210, "AP210", 0, NULL, NULL, NULL, NULL);
 }
+/* ===== p3c_fmt.c ===== */
+/* p3c_fmt.c - []FMT : formatted output (APL2 / Dyalog compatible subset)
+ *
+ *   spec []FMT data      the specification is a text of phrases separated by
+ *                        commas; the result is a character matrix
+ *   []FMT data           the display of the data as a character matrix
+ *
+ * Phrases:  Iw  Fw.d  Ew.d  Gtext  Aw  Xw  Tc  'literal'  and a repeat count
+ *           n  before a phrase or before a group  n( ... ).
+ * Qualifiers before I F E G:  B (blank if zero)  C (thousands commas)
+ *           L (left justify)  Z (zeros instead of blanks)  Kn (scale by 10^n)
+ *           M'text' (negative: text after the number, no minus sign)
+ *           N'text' (negative: text before the number, no minus sign)
+ * Data: a matrix is one column per phrase; a vector is one column; a nested
+ * vector gives one block per item (a numeric item is a column, a text item is
+ * one A field per row).  A phrase list is reused if there are more columns.
+ */
+#define FM_I 1
+#define FM_F 2
+#define FM_E 3
+#define FM_G 4
+#define FM_A 5
+#define FM_X 6
+#define FM_T 7
+#define FM_TEXT 8
+#define FM_MAXPH 512
+
+typedef struct FmPh {
+  int kind;
+  int w, d;
+  int bq, cq, lq, zq, kq;
+  int hasm, hasn;
+  char txt[80];                 /* literal or G pattern */
+  char mtxt[24], ntxt[24];      /* M and N texts */
+} FmPh;
+
+typedef struct FmSpec {
+  FmPh ph[FM_MAXPH];
+  int n;
+} FmSpec;
+
+
+/* the text between delimiters q ... q starting after the opening one */
+static void fm_quoted(const char *s, int *i, int len, char q, char *out, int max)
+{
+  int m = 0;
+  while (*i < len) {
+    if (s[*i] == q) {
+      if (*i + 1 < len && s[*i + 1] == q) {
+        if (m >= max - 1) rt_error("LIMIT ERROR: []FMT: text in the format is too long");
+        out[m++] = q; *i += 2; continue;
+      }
+      (*i)++;
+      out[m] = '\0';
+      return;
+    }
+    if (m >= max - 1) rt_error("LIMIT ERROR: []FMT: text in the format is too long");
+    out[m++] = s[(*i)++];
+  }
+  rt_error("DOMAIN ERROR: []FMT: unterminated text in the format");
+}
+
+static int fm_int(const char *s, int *i, int len, int *has)
+{
+  int v = 0;
+  *has = 0;
+  while (*i < len && is_digit((unsigned char)s[*i])) {
+    v = v * 10 + (s[*i] - '0');
+    if (v > 100000) rt_error("DOMAIN ERROR: []FMT: number too large in the format");
+    (*i)++;
+    *has = 1;
+  }
+  return v;
+}
+
+static void fm_add(FmSpec *sp, const FmPh *p)
+{
+  if (sp->n >= FM_MAXPH) rt_error("LIMIT ERROR: []FMT: format too long");
+  sp->ph[sp->n++] = *p;
+}
+
+/* parse phrases s[i..end) into sp; stops at ")" when depth > 0 */
+static void fm_parse(const char *s, int *i, int len, FmSpec *sp, int depth)
+{
+  for (;;) {
+    FmPh p;
+    int has, rep = 1, c, start;
+    while (*i < len && (s[*i] == ' ' || s[*i] == ',')) (*i)++;
+    if (*i >= len) {
+      if (depth) rt_error("DOMAIN ERROR: []FMT: missing ) in the format");
+      return;
+    }
+    if (s[*i] == ')') {
+      if (!depth) rt_error("DOMAIN ERROR: []FMT: unbalanced ) in the format");
+      (*i)++;
+      return;
+    }
+    memset(&p, 0, sizeof(p));
+    rep = fm_int(s, i, len, &has);
+    if (!has) rep = 1;
+    if (*i < len && s[*i] == '(') {
+      FmSpec *inner = (FmSpec *)xmalloc(sizeof(FmSpec));
+      int k, j;
+      inner->n = 0;
+      trk_add(inner, 0);
+      (*i)++;
+      fm_parse(s, i, len, inner, depth + 1);
+      for (k = 0; k < rep; k++)
+        for (j = 0; j < inner->n; j++) fm_add(sp, &inner->ph[j]);
+      trk_del(inner);
+      free(inner);
+      continue;
+    }
+    if (*i < len && (s[*i] == '\'' || s[*i] == '"')) {
+      char q = s[*i];
+      (*i)++;
+      p.kind = FM_TEXT;
+      fm_quoted(s, i, len, q, p.txt, (int)sizeof(p.txt));
+      { int k; for (k = 0; k < rep; k++) fm_add(sp, &p); }
+      continue;
+    }
+    /* qualifiers */
+    start = 1;
+    while (start && *i < len) {
+      c = to_upper((unsigned char)s[*i]);
+      if (c == ' ') { (*i)++; continue; }
+      if (c == 'B') { p.bq = 1; (*i)++; }
+      else if (c == 'C') { p.cq = 1; (*i)++; }
+      else if (c == 'L') { p.lq = 1; (*i)++; }
+      else if (c == 'Z') { p.zq = 1; (*i)++; }
+      else if (c == 'K') {
+        int neg = 0, v;
+        (*i)++;
+        if (*i < len && (s[*i] == '-' || s[*i] == '~')) { neg = 1; (*i)++; }
+        v = fm_int(s, i, len, &has);
+        if (!has) rt_error("DOMAIN ERROR: []FMT: K needs a number");
+        p.kq = neg ? -v : v;
+      }
+      else if (c == 'M' || c == 'N') {
+        char q;
+        (*i)++;
+        if (*i >= len || (s[*i] != '\'' && s[*i] != '"'))
+          rt_error("DOMAIN ERROR: []FMT: M and N need quoted text");
+        q = s[*i]; (*i)++;
+        if (c == 'M') { p.hasm = 1; fm_quoted(s, i, len, q, p.mtxt, (int)sizeof(p.mtxt)); }
+        else { p.hasn = 1; fm_quoted(s, i, len, q, p.ntxt, (int)sizeof(p.ntxt)); }
+      }
+      else start = 0;
+    }
+    if (*i >= len) rt_error("DOMAIN ERROR: []FMT: phrase has no type letter");
+    c = to_upper((unsigned char)s[*i]);
+    (*i)++;
+    switch (c) {
+    case 'I': p.kind = FM_I; break;
+    case 'F': p.kind = FM_F; break;
+    case 'E': p.kind = FM_E; break;
+    case 'G': p.kind = FM_G; break;
+    case 'A': p.kind = FM_A; break;
+    case 'X': p.kind = FM_X; break;
+    case 'T': p.kind = FM_T; break;
+    default:
+      rt_error("DOMAIN ERROR: []FMT: unknown phrase in the format");
+    }
+    if (p.kind == FM_G) {
+      char q;
+      if (*i >= len || (s[*i] != '\'' && s[*i] != '"'))
+        rt_error("DOMAIN ERROR: []FMT: G needs quoted text");
+      q = s[*i]; (*i)++;
+      fm_quoted(s, i, len, q, p.txt, (int)sizeof(p.txt));
+    } else {
+      p.w = fm_int(s, i, len, &has);
+      if (!has && (p.kind == FM_X || p.kind == FM_T)) p.w = (p.kind == FM_X) ? 1 : 1;
+      if (*i < len && s[*i] == '.' && (p.kind == FM_F || p.kind == FM_E)) {
+        (*i)++;
+        p.d = fm_int(s, i, len, &has);
+      }
+    }
+    {
+      int k;
+      for (k = 0; k < rep; k++) fm_add(sp, &p);
+    }
+  }
+}
+
+/* ---- one number into a field ---- */
+static void fm_commas(char *digits)          /* "1234567" -> "1,234,567" */
+{
+  char tmp[128];
+  int n = (int)strlen(digits), i, k = 0;
+  if (n > 40) return;
+  for (i = 0; i < n; i++) {
+    if (i && (n - i) % 3 == 0) tmp[k++] = ',';
+    tmp[k++] = digits[i];
+  }
+  tmp[k] = '\0';
+  strcpy(digits, tmp);
+}
+
+/* returns a new string of exactly w characters (w == 0: natural width) */
+static char *fm_number(const FmPh *p, double v)
+{
+  char body[320], num[160], *res, *pre = NULL, *post = NULL;
+  int neg, w = p->w, len, fill;
+  const char *sg = "";
+  double sc = v;
+  int k;
+  if (p->kq > 0) for (k = 0; k < p->kq; k++) sc *= 10.0;
+  if (p->kq < 0) for (k = 0; k < -p->kq; k++) sc /= 10.0;
+  if (fabs(sc) > 1e30) {
+    int sw = w > 0 ? w : 1;
+    res = (char *)xmalloc((size_t)sw + 1);
+    memset(res, '*', (size_t)sw);
+    res[sw] = '\0';
+    return res;
+  }
+  if (p->kind == FM_I) sc = floor(fabs(sc) + 0.5) * (sc < 0 ? -1.0 : 1.0);
+  neg = sc < 0.0;
+  if (p->bq && sc == 0.0) { num[0] = '\0'; goto place; }
+  if (p->kind == FM_I) sprintf(num, "%.0f", fabs(sc));
+  else if (p->kind == FM_F) {
+    sprintf(num, "%.*f", p->d, fabs(sc));
+    if (strtod(num, NULL) == 0.0) neg = 0;
+  } else {                                   /* E: d significant digits */
+    int dg = p->d > 0 ? p->d - 1 : 0;
+    char *e;
+    sprintf(num, "%.*E", dg, fabs(sc));
+    e = strchr(num, 'E');
+    if (e) {                                  /* 1.23E+04 -> 1.23E4 / 1.23E-4 */
+      int ex = atoi(e + 1);
+      sprintf(e, "E%d", ex);
+    }
+  }
+  if (p->cq && p->kind != FM_E) {
+    char *dot = strchr(num, '.');
+    if (dot) {
+      char frac[96];
+      strcpy(frac, dot);
+      *dot = '\0';
+      fm_commas(num);
+      strcat(num, frac);
+    } else fm_commas(num);
+  }
+place:
+  if (neg) {
+    if (p->hasm) post = (char *)p->mtxt;
+    else if (p->hasn) pre = (char *)p->ntxt;
+    else sg = "-";
+  }
+  strcpy(body, "");
+  if (pre) strcat(body, pre);
+  strcat(body, sg);
+  strcat(body, num);
+  if (post) strcat(body, post);
+  else if (p->hasm && !neg) { int q = (int)strlen(p->mtxt); while (q--) strcat(body, " "); }
+  if (p->bq && sc == 0.0) body[0] = '\0';
+  len = (int)strlen(body);
+  if (w == 0) w = len;
+  if (len > w && p->kind == FM_F && body[0] == '0' && body[1] == '.' && len - 1 <= w) {
+    memmove(body, body + 1, (size_t)len);       /* drop the leading zero */
+    len--;
+  } else if (len > w && p->kind == FM_F && body[0] == '-' && body[1] == '0' &&
+             body[2] == '.' && len - 1 <= w) {
+    memmove(body + 1, body + 2, (size_t)len - 1);
+    len--;
+  }
+  res = (char *)xmalloc((size_t)w + 1);
+  if (len > w) { memset(res, '*', (size_t)w); res[w] = '\0'; return res; }
+  fill = w - len;
+  if (p->lq) {
+    memcpy(res, body, (size_t)len);
+    memset(res + len, ' ', (size_t)fill);
+  } else if (p->zq && !p->bq) {
+    int signlen = (body[0] == '-') ? 1 : 0;
+    memcpy(res, body, (size_t)signlen);
+    memset(res + signlen, '0', (size_t)fill);
+    memcpy(res + signlen + fill, body + signlen, (size_t)(len - signlen));
+  } else {
+    memset(res, ' ', (size_t)fill);
+    memcpy(res + fill, body, (size_t)len);
+  }
+  res[w] = '\0';
+  return res;
+}
+
+/* G: each 9 in the pattern takes a digit of the rounded value, from the right */
+static char *fm_pattern(const FmPh *p, double v)
+{
+  char digits[64];
+  int n9 = 0, i, di, len = (int)strlen(p->txt), nd;
+  char *res = (char *)xmalloc((size_t)len + 1);
+  double sc = v;
+  int k;
+  for (k = 0; k < p->kq; k++) sc *= 10.0;
+  for (k = 0; k < -p->kq; k++) sc /= 10.0;
+  sc = floor(fabs(sc) + 0.5);
+  if (sc >= 1e15) sc = 0.0;
+  sprintf(digits, "%.0f", sc);
+  nd = (int)strlen(digits);
+  for (i = 0; i < len; i++) if (p->txt[i] == '9') n9++;
+  di = nd - 1;
+  res[len] = '\0';
+  for (i = len - 1; i >= 0; i--) {
+    if (p->txt[i] == '9') {
+      if (di >= 0) res[i] = digits[di--];
+      else res[i] = p->zq ? '0' : ' ';
+    } else res[i] = p->txt[i];
+  }
+  if (di >= 0) memset(res, '*', (size_t)len);       /* did not fit */
+  return res;
+}
+
+/* ---- the blocks of data ---- */
+typedef struct FmBlk {
+  const Arr *a;
+  int ischar, rows, cols;
+} FmBlk;
+
+static void fm_dims(const Arr *a, FmBlk *b)
+{
+  b->a = a;
+  b->ischar = (a->type == T_CHR);
+  if (a->type == T_NEST || a->type == T_CPX)
+    rt_error("DOMAIN ERROR: []FMT: the data must be numbers or text");
+  if (a->rank == 0) { b->rows = 1; b->cols = 1; }
+  else if (a->rank == 1) {
+    if (b->ischar) { b->rows = 1; b->cols = a->n; }
+    else { b->rows = a->n; b->cols = 1; }
+  } else if (a->rank == 2) { b->rows = a->shape[0]; b->cols = a->shape[1]; }
+  else rt_error("RANK ERROR: []FMT: the data has too many axes");
+}
+
+typedef struct FmLine { char *s; int len, cap; } FmLine;
+static void fl_put(FmLine *l, int pos, const char *t, int n)
+{
+  if (pos + n > l->cap) {
+    int nc = pos + n + 64;
+    l->s = (char *)xrealloc(l->s, (size_t)nc);
+    memset(l->s + l->cap, ' ', (size_t)(nc - l->cap));
+    l->cap = nc;
+  }
+  memcpy(l->s + pos, t, (size_t)n);
+  if (pos + n > l->len) l->len = pos + n;
+}
+
+static Arr *fmt_dyadic(Arr *spec, Arr *data)
+{
+  FmSpec *spp;
+  FmBlk *bl;
+  int nbl = 0, i, rows = 0, r, nsp, specrows;
+  int len;
+  FmLine *lines;
+  Arr *res;
+  int maxw = 0;
+  char *sbuf;
+  int pos0 = 0;
+
+  if (spec->type != T_CHR || spec->rank > 1)
+    rt_error("DOMAIN ERROR: []FMT: the format must be a text vector");
+  len = spec->n;
+  sbuf = xstrndup(spec->chr, len);
+  trk_add(sbuf, 0);
+  spp = (FmSpec *)xmalloc(sizeof(FmSpec));
+  spp->n = 0;
+  trk_add(spp, 0);
+  fm_parse(sbuf, &pos0, len, spp, 0);
+  trk_del(sbuf);
+  free(sbuf);
+  nsp = spp->n;
+
+  /* blocks */
+  if (data->type == T_NEST && data->rank <= 1 && !(data->rank == 0)) {
+    nbl = data->n;
+    bl = (FmBlk *)xmalloc(sizeof(FmBlk) * (size_t)(nbl ? nbl : 1));
+    trk_add(bl, 0);
+    for (i = 0; i < nbl; i++) fm_dims(data->sub[i], &bl[i]);
+  } else {
+    nbl = 1;
+    bl = (FmBlk *)xmalloc(sizeof(FmBlk));
+    trk_add(bl, 0);
+    fm_dims(data, &bl[0]);
+  }
+  for (i = 0; i < nbl; i++) {
+    if (bl[i].rows == 1 && !bl[i].ischar && bl[i].cols == 1 && bl[i].a->rank == 0)
+      continue;                              /* a scalar extends */
+    if (rows == 0) rows = bl[i].rows;
+    else if (bl[i].rows != rows && bl[i].rows != 1)
+      rt_error("LENGTH ERROR: []FMT: the columns have different lengths");
+  }
+  if (rows == 0) {
+    rows = 1;
+    for (i = 0; i < nbl; i++) if (bl[i].rows > rows) rows = bl[i].rows;
+  }
+  specrows = rows;
+
+  lines = (FmLine *)xmalloc(sizeof(FmLine) * (size_t)(rows ? rows : 1));
+  trk_add(lines, 0);
+  for (r = 0; r < rows; r++) { lines[r].s = NULL; lines[r].len = 0; lines[r].cap = 0; }
+
+  {
+    int pi = 0;                 /* phrase index (cyclic) */
+    int bi = 0, col = 0;        /* current block and column inside it */
+    int ndata = 0, guard = 0;
+    int *cur = (int *)xmalloc(sizeof(int) * (size_t)(rows ? rows : 1));
+    trk_add(cur, 0);
+    for (i = 0; i < nsp; i++)
+      if (spp->ph[i].kind != FM_X && spp->ph[i].kind != FM_T && spp->ph[i].kind != FM_TEXT)
+        ndata++;
+    /* the column position of each line (for T) */
+    for (r = 0; r < rows; r++) cur[r] = 0;
+    if (nbl > 0 && ndata == 0 && nsp > 0) {
+      /* text only: print it for every row */
+    }
+    while (bi < nbl || (nsp > 0 && ndata == 0 && guard == 0)) {
+      const FmPh *p;
+      if (nsp == 0) break;
+      p = &spp->ph[pi % nsp];
+      guard++;
+      if (guard > 100000) break;
+      if (p->kind == FM_TEXT || p->kind == FM_X || p->kind == FM_T) {
+        for (r = 0; r < rows; r++) {
+          if (p->kind == FM_TEXT) {
+            fl_put(&lines[r], cur[r], p->txt, (int)strlen(p->txt));
+            cur[r] += (int)strlen(p->txt);
+          } else if (p->kind == FM_X) {
+            char *bk = (char *)xmalloc((size_t)p->w + 1);
+            memset(bk, ' ', (size_t)p->w);
+            fl_put(&lines[r], cur[r], bk, p->w);
+            free(bk);
+            cur[r] += p->w;
+          } else {
+            cur[r] = p->w > 0 ? p->w - 1 : 0;
+            if (cur[r] > lines[r].len) {
+              char *bk = (char *)xmalloc((size_t)(cur[r] - lines[r].len) + 1);
+              memset(bk, ' ', (size_t)(cur[r] - lines[r].len));
+              fl_put(&lines[r], lines[r].len, bk, cur[r] - lines[r].len);
+              free(bk);
+            }
+          }
+        }
+        pi++;
+        if (ndata == 0) break;
+        continue;
+      }
+      /* a data phrase */
+      if (bi >= nbl) break;
+      {
+        const FmBlk *b = &bl[bi];
+        if (b->ischar != (p->kind == FM_A)) {
+          const char *msg = b->ischar ? "DOMAIN ERROR: []FMT: text needs an A phrase"
+                                      : "DOMAIN ERROR: []FMT: numbers need I, F, E or G";
+          for (r = 0; r < rows; r++) free(lines[r].s);
+          trk_del(cur); free(cur);
+          trk_del(lines); free(lines);
+          rt_error(msg);
+        }
+        for (r = 0; r < rows; r++) {
+          char *fld;
+          int w;
+          int rr = (b->rows == 1) ? 0 : r;
+          if (b->ischar) {
+            int cc = b->cols, k;
+            w = p->w > 0 ? p->w : cc;
+            fld = (char *)xmalloc((size_t)w + 1);
+            memset(fld, ' ', (size_t)w);
+            for (k = 0; k < cc && k < w; k++)
+              fld[k] = (b->a->rank == 0) ? b->a->chr[0]
+                       : b->a->chr[rr * b->cols + k];
+            fld[w] = '\0';
+          } else {
+            double v = b->a->num[b->a->rank == 0 ? 0 : rr * b->cols + col];
+            if (p->kind == FM_G) fld = fm_pattern(p, v);
+            else fld = fm_number(p, v);
+            w = (int)strlen(fld);
+          }
+          fl_put(&lines[r], cur[r], fld, w);
+          cur[r] += w;
+          free(fld);
+        }
+        if (b->ischar) { bi++; col = 0; }
+        else { col++; if (col >= b->cols) { bi++; col = 0; } }
+        pi++;
+        if (bi >= nbl) {
+          /* trailing text and blanks that follow the last field */
+          while (pi % (nsp ? nsp : 1) != 0 || pi == 0) {
+            const FmPh *q;
+            if (nsp == 0) break;
+            q = &spp->ph[pi % nsp];
+            if (q->kind != FM_TEXT && q->kind != FM_X) break;
+            for (r = 0; r < rows; r++) {
+              if (q->kind == FM_TEXT) {
+                fl_put(&lines[r], cur[r], q->txt, (int)strlen(q->txt));
+                cur[r] += (int)strlen(q->txt);
+              } else {
+                char *bk = (char *)xmalloc((size_t)q->w + 1);
+                memset(bk, ' ', (size_t)q->w);
+                fl_put(&lines[r], cur[r], bk, q->w);
+                free(bk);
+                cur[r] += q->w;
+              }
+            }
+            pi++;
+          }
+        }
+      }
+    }
+    trk_del(cur);
+    free(cur);
+  }
+  trk_del(spp); free(spp);
+  trk_del(bl); free(bl);
+  for (r = 0; r < rows; r++) if (lines[r].len > maxw) maxw = lines[r].len;
+  {
+    int sh[2];
+    sh[0] = rows; sh[1] = maxw;
+    res = a_new(T_CHR, 2, sh);
+  }
+  for (r = 0; r < rows; r++) {
+    memset(res->chr + r * maxw, ' ', (size_t)maxw);
+    if (lines[r].len) memcpy(res->chr + r * maxw, lines[r].s, (size_t)lines[r].len);
+    free(lines[r].s);
+  }
+  trk_del(lines);
+  free(lines);
+  (void)specrows;
+  return res;
+}
+
+/* monadic: the display of x as a character matrix */
+static Arr *fmt_monadic(Arr *x)
+{
+  Blk *b = render(x);
+  Arr *res;
+  int sh[2], i, n;
+  sh[0] = b->h > 0 ? b->h : 1;
+  sh[1] = b->w;
+  res = a_new(T_CHR, 2, sh);
+  memset(res->chr, ' ', (size_t)(sh[0] * sh[1]));
+  for (i = 0; i < b->h; i++) {
+    n = (int)strlen(b->ln[i]);
+    if (n > b->w) n = b->w;
+    memcpy(res->chr + i * sh[1], b->ln[i], (size_t)n);
+  }
+  blk_free(b);
+  return res;
+}
 /* ===== p4_eval.c ===== */
 /* p4_eval.c - variables, user functions, parser/evaluator, operators */
 
@@ -3275,6 +4174,12 @@ static Arr *op_reduce(const FnRef *f, Arr *x, int ax)
   int k, outer, len, inner, o, j, i, sh[MAXRANK], rank, m;
   Arr *r;
   if (x->rank == 0) return a_ref(x);
+  if (x->type == T_CPX) {                 /* complex: item by item */
+    Arr *nx = a_to_nest(x);
+    r = op_reduce(f, nx, ax);
+    a_rel(nx);
+    return r;
+  }
   k = axis_pick(x, ax, P_REDUCE);
   axis_dims(x, k, &outer, &len, &inner);
   rank = x->rank - 1;
@@ -3318,6 +4223,12 @@ static Arr *op_scan(const FnRef *f, Arr *x, int ax)
   int k, outer, len, inner, o, j, i, q;
   Arr *r;
   if (x->rank == 0) return a_ref(x);
+  if (x->type == T_CPX) {
+    Arr *nx = a_to_nest(x);
+    r = op_scan(f, nx, ax);
+    a_rel(nx);
+    return r;
+  }
   k = axis_pick(x, ax, P_SCAN);
   axis_dims(x, k, &outer, &len, &inner);
   if (x->type == T_NEST) {
@@ -3375,7 +4286,7 @@ static Arr *op_outer(const FnRef *f, Arr *x, Arr *y)
   for (i = 0; i < x->rank; i++) sh[i] = x->shape[i];
   for (j = 0; j < y->rank; j++) sh[x->rank + j] = y->shape[j];
   if (x->type == T_NEST || y->type == T_NEST || x->type == T_CHR ||
-      y->type == T_CHR) {
+      y->type == T_CHR || x->type == T_CPX || y->type == T_CPX) {
     r = a_new(T_NEST, rank, sh);
     k = 0;
     for (i = 0; i < x->n; i++) {
@@ -3819,13 +4730,18 @@ static Arr *member_access(Ps *p, Arr *obj, int allow_args, Fn **mfn)
   return res;
 }
 
+/* selective assignment:  (selection v) <- value
+ * While the selection is evaluated, the token sel_tok stands for an array of
+ * positions 1..n shaped like the variable instead of its value; whatever the
+ * selection leaves are the positions to assign.  A 0 is a fill item. */
+
 static Arr *parse_item0(Ps *p)
 {
   Tok *t = &p->t[p->i];
   Arr *a;
   if (t->k == K_NUM) {
     p->i++;
-    return a_scalar(t->num);
+    return a_cscalar(t->num, t->im);
   }
   if (t->k == K_STR) {
     int n = (int)strlen(t->s);
@@ -3860,8 +4776,13 @@ static Arr *parse_item0(Ps *p)
     return quad_value(t->s);
   }
   if (t->k == K_NAME) {
-    Fn *u = fn_find(t->s);
+    Fn *u;
     Arr *v;
+    if (t == sel_tok && sel_idx) {          /* selective assignment: positions */
+      p->i++;
+      return a_ref(sel_idx);
+    }
+    u = fn_find(t->s);
     if (u) {
       if (u->arity != 0) syn_error_s("missing argument for function: ", t->s);
       p->i++;
@@ -3933,10 +4854,14 @@ static Arr *parse_item(Ps *p)
   Arr *a;
   if (p->t[p->i].k == K_NUM) {
     int n = 0, i;
-    while (p->t[p->i + n].k == K_NUM) n++;
+    int cx = 0;
+    while (p->t[p->i + n].k == K_NUM) { if (p->t[p->i + n].im != 0.0) cx = 1; n++; }
     if (n > 1 && tok_sym(&p->t[p->i + n], "[")) {
-      a = a_vec(T_NUM, n);
-      for (i = 0; i < n; i++) a->num[i] = p->t[p->i + i].num;
+      a = a_vec(cx ? T_CPX : T_NUM, n);
+      for (i = 0; i < n; i++) {
+        a->num[i] = p->t[p->i + i].num;
+        if (cx) a->im[i] = p->t[p->i + i].im;
+      }
       p->i += n;
     } else a = parse_item0(p);
   } else a = parse_item0(p);
@@ -3983,6 +4908,7 @@ static Arr *build_strand(Arr **it, int n)
   } else {
     r = a_vec(T_NEST, n);
     for (i = 0; i < n; i++) a_put(r, i, it[i]);
+    r = a_simplify(r);      /* real and complex scalars make a complex vector */
   }
   return r;
 }
@@ -4427,6 +5353,82 @@ static void assign_check(const char *name)
     syn_error_s("name is already a function: ", name);
 }
 
+static int sel_word_ok(const char *w)
+{
+  static const char *ok[] = { "take", "drop", "reverse", "rotate", "transpose",
+    "ravel", "compress", "expand", "pick", "first", "disclose", "mix", "rho",
+    "index", "zilch", NULL };
+  int i;
+  for (i = 0; ok[i]; i++) if (strcmp(w, ok[i]) == 0) return 1;
+  return 0;
+}
+
+static void sel_assign(Tok *t, int e)
+{
+  Ps p;
+  int i, d = 0, k = -1;
+  Arr *cur, *idx, *pos, *val, *r, *base, *v;
+  char *name;
+  /* only structural functions at the top level of the selection */
+  for (i = 1; i < e; i++) {
+    if (tok_sym(&t[i], "(") || tok_sym(&t[i], "[")) { d++; continue; }
+    if (tok_sym(&t[i], ")") || tok_sym(&t[i], "]")) { d--; continue; }
+    if (d != 0) continue;
+    if (t[i].k == K_SYM && !tok_sym(&t[i], ";"))
+      rt_error("DOMAIN ERROR: selective assignment: only structural functions can select");
+    if (t[i].k == K_NAME) {
+      if (prim_lookup(t[i].s) || strcmp(t[i].s, "zilch") == 0) {
+        if (!sel_word_ok(t[i].s))
+          rt_error("DOMAIN ERROR: selective assignment: only structural functions can select");
+      } else if (!fn_find(t[i].s) && var_get(t[i].s)) k = i;
+    }
+  }
+  if (k < 0) syn_error("selective assignment needs a variable to select from");
+  name = t[k].s;
+  assign_check(name);
+  cur = var_get(name);
+  if (cur->type == T_NEST && cur->rank == 0)
+    rt_error("DOMAIN ERROR: selective assignment: cannot select from an enclosed value");
+  idx = a_new(T_NUM, cur->rank, cur->shape);
+  for (i = 0; i < idx->n; i++) idx->num[i] = (double)(i + 1);
+  sel_tok = &t[k]; sel_idx = idx;
+  p.t = t; p.i = 1;
+  pos = parse_expr(&p);               /* an error leaves sel_tok set: reset below */
+  sel_tok = NULL; sel_idx = NULL;
+  a_rel(idx);
+  if (!pos) syn_error("selection returned no value");
+  if (p.i != e) { a_rel(pos); unexpected(&p.t[p.i]); }
+  p.i = e + 2;
+  val = need_val(parse_expr(&p));
+  if (p.t[p.i].k != K_END) { a_rel(pos); a_rel(val); unexpected(&p.t[p.i]); }
+  if (pos->type != T_NUM) {
+    a_rel(pos); a_rel(val);
+    rt_error("DOMAIN ERROR: selective assignment: the selection is not part of the variable");
+  }
+  if (val->n != 1 && (val->n != pos->n || (pos->rank > 0 && val->rank > 0 && !a_same_shape(pos, val)))) {
+    char buf[96];
+    sprintf(buf, "LENGTH ERROR: selective assignment %d / %d", val->n, pos->n);
+    a_rel(pos); a_rel(val);
+    rt_error(buf);
+  }
+  cur = var_get(name);
+  if (cur->type == val->type) { base = a_ref(cur); v = a_ref(val); }
+  else { base = a_to_nest(cur); v = a_to_nest(val); }
+  r = a_like(base, cur->rank, cur->shape);
+  for (i = 0; i < cur->n; i++) a_copyel(r, i, base, i);
+  a_rel(base);
+  for (i = 0; i < pos->n; i++) {
+    double q = pos->num[i];
+    if (q != floor(q) || q < 1.0 || q > (double)cur->n) {
+      a_rel(pos); a_rel(val); a_rel(v); a_rel(r);
+      rt_error("DOMAIN ERROR: selective assignment: the selection is not part of the variable");
+    }
+    a_copyel(r, (int)q - 1, v, v->n == 1 ? 0 : i);
+  }
+  a_rel(v); a_rel(pos); a_rel(val);
+  var_set(name, a_simplify(r));
+}
+
 static void exec_tokens(Tok *t)
 {
   Ps p;
@@ -4483,6 +5485,10 @@ static void exec_tokens(Tok *t)
     var_set(t[0].s, NULL);
     fn_install_here(nf);
     return;
+  }
+  if (tok_sym(&t[0], "(")) {
+    int e = paren_end(t, 0);
+    if (e > 0 && tok_sym(&t[e + 1], "<-")) { sel_assign(t, e); return; }
   }
   if (t[0].k == K_NAME && tok_sym(&t[1], "[")) {
     int d = 0, j = 1;
@@ -4581,6 +5587,10 @@ static int is_assignment(const Tok *t)
 {
   int d = 0, j = 1;
   if (t[0].k == K_END) return 0;
+  if (tok_sym(&t[0], "(")) {
+    int e = paren_end(t, 0);
+    return e > 0 && tok_sym(&t[e + 1], "<-");
+  }
   if ((t[0].k == K_NAME || t[0].k == K_QNAME || t[0].k == K_QUAD) &&
       tok_sym(&t[1], "<-")) return 1;
   if (t[0].k == K_NAME && tok_sym(&t[1], "[")) {
@@ -4618,10 +5628,10 @@ static Tok *tok_slice(const Tok *t, int a, int b)       /* [a, b) */
   Tok *r = (Tok *)xmalloc(sizeof(Tok) * (size_t)(n + 1));
   for (i = 0; i < n; i++) {
     r[i].k = t[a + i].k;
-    r[i].num = t[a + i].num;
+    r[i].num = t[a + i].num; r[i].im = t[a + i].im;
     r[i].s = t[a + i].s ? xstrdup(t[a + i].s) : NULL;
   }
-  r[n].k = K_END; r[n].num = 0; r[n].s = NULL;
+  r[n].k = K_END; r[n].num = 0; r[n].im = 0; r[n].s = NULL;
   return r;
 }
 
@@ -4638,7 +5648,10 @@ static char *tok_src(const Tok *t, int a, int b)
     char *tmp = NULL;
     size_t pl;
     switch (t[i].k) {
-    case K_NUM: sprintf(buf, "%.17g", t[i].num); break;
+    case K_NUM:
+      if (t[i].im != 0.0) sprintf(buf, "%.17gJ%.17g", t[i].num, t[i].im);
+      else sprintf(buf, "%.17g", t[i].num);
+      break;
     case K_NAME: case K_SYM: piece = t[i].s; break;
     case K_QUAD: piece = "[]"; break;
     case K_QNAME:
@@ -4794,11 +5807,11 @@ static Arr *apply_userop(Ps *p, Fn *u, Arr *left)
     else if (tok_name(&u->optok[i], "omegaomega")) { a = gs; b = ge; }
     if (a >= 0) {
       for (j = a; j < b; j++) {
-        q->k = p->t[j].k; q->num = p->t[j].num;
+        q->k = p->t[j].k; q->num = p->t[j].num; q->im = p->t[j].im;
         q->s = p->t[j].s ? xstrdup(p->t[j].s) : NULL; q++;
       }
     } else {
-      q->k = u->optok[i].k; q->num = u->optok[i].num;
+      q->k = u->optok[i].k; q->num = u->optok[i].num; q->im = u->optok[i].im;
       q->s = u->optok[i].s ? xstrdup(u->optok[i].s) : NULL; q++;
     }
   }
@@ -7042,10 +8055,16 @@ static void sys_lib(void)
 /* ---------- workspace save ---------- */
 /* write an expression that rebuilds a nested array (strand form) */
 static void emit_expr(FILE *fp, const Arr *a);
+static void emit_numtxt(const Arr *a, int i, char *buf)
+{
+  if (a->type == T_CPX && a->im[i] != 0.0)
+    sprintf(buf, "%.15gJ%.15g", a->num[i], a->im[i]);
+  else sprintf(buf, "%.15g", a->num[i]);
+}
 static void emit_simple(FILE *fp, const Arr *a)
 {
   int i;
-  char buf[64];
+  char buf[96];
   if (a->type == T_CHR) {
     if (a->rank == 1 && a->n == 1) fprintf(fp, "(1) rho ");
     else if (a->rank != 1 && a->rank != 0) {
@@ -7062,18 +8081,18 @@ static void emit_simple(FILE *fp, const Arr *a)
     fprintf(fp, "'");
     return;
   }
-  if (a->rank == 0) { sprintf(buf, "%.15g", a->num[0]); fprintf(fp, "%s", buf); return; }
+  if (a->rank == 0) { emit_numtxt(a, 0, buf); fprintf(fp, "%s", buf); return; }
   if (a->rank > 1 || a->n <= 1) {
     fprintf(fp, "(");
     for (i = 0; i < a->rank; i++)
       fprintf(fp, "%s%d", i ? " " : "", a->shape[i]);
     fprintf(fp, ") rho ");
     if (a->n == 0) { fprintf(fp, "0"); return; }
-    if (a->n == 1) { sprintf(buf, "%.15g", a->num[0]); fprintf(fp, "%s", buf); return; }
+    if (a->n == 1) { emit_numtxt(a, 0, buf); fprintf(fp, "%s", buf); return; }
   }
   fprintf(fp, "(");
   for (i = 0; i < a->n; i++) {
-    sprintf(buf, "%.15g", a->num[i]);
+    emit_numtxt(a, i, buf);
     fprintf(fp, "%s%s", i ? " " : "", buf);
   }
   fprintf(fp, ")");
@@ -7141,7 +8160,7 @@ static void save_value(FILE *fp, const char *name, const Arr *a)
     return;
   }
   if (a->rank == 0) {
-    sprintf(buf, "%.15g", a->num[0]);
+    emit_numtxt(a, 0, buf);
     fprintf(fp, "%s\n", buf);
     return;
   }
@@ -7150,11 +8169,11 @@ static void save_value(FILE *fp, const char *name, const Arr *a)
     for (i = 0; i < a->rank; i++) fprintf(fp, "%s%d", i ? " " : "", a->shape[i]);
     fprintf(fp, ") rho ");
     if (a->n == 0) { fprintf(fp, "0\n"); return; }
-    if (a->n == 1) { sprintf(buf, "%.15g", a->num[0]); fprintf(fp, "%s\n", buf); return; }
+    if (a->n == 1) { emit_numtxt(a, 0, buf); fprintf(fp, "%s\n", buf); return; }
   }
   fprintf(fp, "(");
   for (i = 0; i < a->n; i++) {
-    sprintf(buf, "%.15g", a->num[i]);
+    emit_numtxt(a, i, buf);
     fprintf(fp, "%s%s", i ? " " : "", buf);
   }
   fprintf(fp, ")\n");
@@ -8693,7 +9712,7 @@ static int oo_quad_is_fn(const char *name)
 {
   static const char *const names[] = {
     "NEW", "NS", "CS", "NL", "CLASS", "INSTANCES", "DF", "NQ", "NR", "FIX",
-    "OBJ", "OBJREF", NULL };
+    "OBJ", "OBJREF", "FMT", NULL };
   int i;
   for (i = 0; names[i]; i++) if (strcmp(name, names[i]) == 0) return 1;
   return 0;
@@ -8713,6 +9732,7 @@ static int oo_quad_fn(const char *name, Arr *x, Arr **out)
   if (strcmp(name, "NQ") == 0) { *out = q_nq(x); return 1; }
   if (strcmp(name, "OBJ") == 0) { *out = q_obj(x); return 1; }
   if (strcmp(name, "OBJREF") == 0) { *out = q_objref(x); return 1; }
+  if (strcmp(name, "FMT") == 0) { *out = fmt_monadic(x); return 1; }
   if (strcmp(name, "NL") == 0) { *out = nl_list(NULL, x); return 1; }
   if (strcmp(name, "FIX") == 0) { *out = fix_script(x); return 1; }
   if (strcmp(name, "NR") == 0) { *out = nr_define(x); return 1; }
@@ -8729,11 +9749,12 @@ static int oo_quad_dya(const char *name)
 {
   return strcmp(name, "ON") == 0 || strcmp(name, "ISA") == 0 ||
          strcmp(name, "DF") == 0 || strcmp(name, "NL") == 0 ||
-         strcmp(name, "PROC") == 0;
+         strcmp(name, "PROC") == 0 || strcmp(name, "FMT") == 0;
 }
 
 static Arr *quad_dya(const char *name, Arr *x, Arr *y)
 {
+  if (strcmp(name, "FMT") == 0) return fmt_dyadic(x, y);
   if (strcmp(name, "ON") == 0) {
     Scope *o = obj_of(x);
     char *ev, *path;

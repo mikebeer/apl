@@ -1043,7 +1043,7 @@ static int oo_quad_is_fn(const char *name)
 {
   static const char *const names[] = {
     "NEW", "NS", "CS", "NL", "CLASS", "INSTANCES", "DF", "NQ", "NR", "FIX",
-    "OBJ", "OBJREF", NULL };
+    "OBJ", "OBJREF", "FMT", NULL };
   int i;
   for (i = 0; names[i]; i++) if (strcmp(name, names[i]) == 0) return 1;
   return 0;
@@ -1063,6 +1063,7 @@ static int oo_quad_fn(const char *name, Arr *x, Arr **out)
   if (strcmp(name, "NQ") == 0) { *out = q_nq(x); return 1; }
   if (strcmp(name, "OBJ") == 0) { *out = q_obj(x); return 1; }
   if (strcmp(name, "OBJREF") == 0) { *out = q_objref(x); return 1; }
+  if (strcmp(name, "FMT") == 0) { *out = fmt_monadic(x); return 1; }
   if (strcmp(name, "NL") == 0) { *out = nl_list(NULL, x); return 1; }
   if (strcmp(name, "FIX") == 0) { *out = fix_script(x); return 1; }
   if (strcmp(name, "NR") == 0) { *out = nr_define(x); return 1; }
@@ -1079,11 +1080,12 @@ static int oo_quad_dya(const char *name)
 {
   return strcmp(name, "ON") == 0 || strcmp(name, "ISA") == 0 ||
          strcmp(name, "DF") == 0 || strcmp(name, "NL") == 0 ||
-         strcmp(name, "PROC") == 0;
+         strcmp(name, "PROC") == 0 || strcmp(name, "FMT") == 0;
 }
 
 static Arr *quad_dya(const char *name, Arr *x, Arr *y)
 {
+  if (strcmp(name, "FMT") == 0) return fmt_dyadic(x, y);
   if (strcmp(name, "ON") == 0) {
     Scope *o = obj_of(x);
     char *ev, *path;

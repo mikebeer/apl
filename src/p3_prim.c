@@ -98,6 +98,9 @@ static void need_num(const Arr *a, int id)
   if (a->type == T_NEST)
     rt_error_s("DOMAIN ERROR: ", prim_name(id),
                " does not accept a nested value");
+  if (a->type == T_CPX)
+    rt_error_s("DOMAIN ERROR: ", prim_name(id),
+               " does not accept a complex value");
   if (a->type != T_NUM)
     rt_error_s("DOMAIN ERROR: ", prim_name(id),
                " does not accept a text value");
@@ -314,6 +317,258 @@ static double chk_num(double v)
 static double sdya(int id, double a, double b) { return chk_num(sdya0(id, a, b)); }
 static double smon(int id, double a) { return chk_num(smon0(id, a)); }
 
+
+/* ---------- complex numbers ---------- */
+typedef struct Cx { double re, im; } Cx;
+
+static Cx cx_of(double re, double im) { Cx z; z.re = re; z.im = im; return z; }
+static Cx cx_get(const Arr *a, int i)
+{
+  Cx z;
+  z.re = a->num[i];
+  z.im = (a->type == T_CPX) ? a->im[i] : 0.0;
+  return z;
+}
+static double cx_abs(Cx z) { return hypot(z.re, z.im); }
+static Cx cx_add(Cx a, Cx b) { return cx_of(a.re + b.re, a.im + b.im); }
+static Cx cx_sub(Cx a, Cx b) { return cx_of(a.re - b.re, a.im - b.im); }
+static Cx cx_mul(Cx a, Cx b)
+{
+  return cx_of(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re);
+}
+static Cx cx_div(Cx a, Cx b)
+{
+  double d;
+  if (b.re == 0.0 && b.im == 0.0) {
+    if (a.re == 0.0 && a.im == 0.0) return cx_of(1.0, 0.0);
+    rt_error("DOMAIN ERROR: divide by zero");
+  }
+  /* Smith's algorithm: no overflow for large parts */
+  if (fabs(b.re) >= fabs(b.im)) {
+    double r = b.im / b.re;
+    d = b.re + b.im * r;
+    return cx_of((a.re + a.im * r) / d, (a.im - a.re * r) / d);
+  } else {
+    double r = b.re / b.im;
+    d = b.re * r + b.im;
+    return cx_of((a.re * r + a.im) / d, (a.im * r - a.re) / d);
+  }
+}
+/* remove rounding dust: a part that is tiny next to the other is zero */
+static Cx cx_clean(Cx z)
+{
+  double m = fabs(z.re) > fabs(z.im) ? fabs(z.re) : fabs(z.im);
+  if (fabs(z.im) <= 1e-14 * m) z.im = 0.0;
+  if (fabs(z.re) <= 1e-14 * m) z.re = 0.0;
+  return z;
+}
+static Cx cx_sqrt(Cx z)
+{
+  double m = cx_abs(z), t, u;
+  if (m == 0.0) return cx_of(0.0, 0.0);
+  t = sqrt((m + fabs(z.re)) * 0.5);
+  u = z.im / (2.0 * t);
+  if (z.re >= 0.0) return cx_of(t, u);
+  return cx_of(fabs(u), z.im >= 0.0 ? t : -t);
+}
+static Cx cx_exp(Cx z)
+{
+  double e = exp(z.re);
+  return cx_clean(cx_of(e * cos(z.im), e * sin(z.im)));
+}
+static Cx cx_ln(Cx z)
+{
+  if (z.re == 0.0 && z.im == 0.0) rt_error("DOMAIN ERROR: ln of zero");
+  return cx_of(log(cx_abs(z)), atan2(z.im, z.re));
+}
+static Cx cx_pow(Cx a, Cx b)
+{
+  if (a.re == 0.0 && a.im == 0.0) {
+    if (b.re == 0.0 && b.im == 0.0) return cx_of(1.0, 0.0);
+    if (b.re <= 0.0) rt_error("DOMAIN ERROR: power: zero to a non-positive power");
+    return cx_of(0.0, 0.0);
+  }
+  /* small whole exponents by multiplication: exact */
+  if (b.im == 0.0 && b.re == floor(b.re) && fabs(b.re) <= 64.0) {
+    int n = (int)fabs(b.re), k;
+    Cx r = cx_of(1.0, 0.0);
+    for (k = 0; k < n; k++) r = cx_mul(r, a);
+    return b.re < 0.0 ? cx_div(cx_of(1.0, 0.0), r) : r;
+  }
+  if (b.im == 0.0 && b.re == 0.5) return cx_sqrt(a);
+  return cx_exp(cx_mul(b, cx_ln(a)));
+}
+static Cx cx_sin(Cx z)
+{ return cx_of(sin(z.re) * cosh(z.im), cos(z.re) * sinh(z.im)); }
+static Cx cx_cos(Cx z)
+{ return cx_of(cos(z.re) * cosh(z.im), -sin(z.re) * sinh(z.im)); }
+static Cx cx_sinh(Cx z)
+{ return cx_of(sinh(z.re) * cos(z.im), cosh(z.re) * sin(z.im)); }
+static Cx cx_cosh(Cx z)
+{ return cx_of(cosh(z.re) * cos(z.im), sinh(z.re) * sin(z.im)); }
+
+static Cx cx_circle(int k, Cx z)
+{
+  Cx one = cx_of(1.0, 0.0), i1 = cx_of(0.0, 1.0), t;
+  switch (k) {
+  case 1: return cx_clean(cx_sin(z));
+  case 2: return cx_clean(cx_cos(z));
+  case 3: return cx_clean(cx_div(cx_sin(z), cx_cos(z)));
+  case 5: return cx_clean(cx_sinh(z));
+  case 6: return cx_clean(cx_cosh(z));
+  case 7: return cx_clean(cx_div(cx_sinh(z), cx_cosh(z)));
+  case 0: return cx_sqrt(cx_sub(one, cx_mul(z, z)));
+  case 4: return cx_sqrt(cx_sub(cx_mul(z, z), one));
+  case -4: return cx_sqrt(cx_sub(cx_mul(z, z), one));
+  case 9: return cx_of(z.re, 0.0);
+  case 10: return cx_of(cx_abs(z), 0.0);
+  case 11: return cx_of(z.im, 0.0);
+  case 12: return cx_of(atan2(z.im, z.re), 0.0);
+  case -1:  /* asin z = -i ln(iz + sqrt(1-z^2)) */
+    if (z.im == 0.0 && fabs(z.re) > 1.0)      /* on the cut: imaginary part > 0 */
+      return cx_of(z.re > 0.0 ? 1.5707963267948966 : -1.5707963267948966,
+                   log(fabs(z.re) + sqrt(z.re * z.re - 1.0)));
+    t = cx_ln(cx_add(cx_mul(i1, z), cx_sqrt(cx_sub(one, cx_mul(z, z)))));
+    return cx_clean(cx_of(t.im, -t.re));
+  case -2:  /* acos z = pi/2 - asin z */
+    t = cx_circle(-1, z);
+    return cx_clean(cx_of(1.5707963267948966 - t.re, -t.im));
+  case -3:  /* atan z = (ln(1+iz) - ln(1-iz)) / 2i */
+    t = cx_sub(cx_ln(cx_add(one, cx_mul(i1, z))), cx_ln(cx_sub(one, cx_mul(i1, z))));
+    return cx_clean(cx_of(t.im * 0.5, -t.re * 0.5));
+  case -5: return cx_clean(cx_ln(cx_add(z, cx_sqrt(cx_add(cx_mul(z, z), one)))));
+  case -6: return cx_clean(cx_ln(cx_add(z, cx_mul(cx_sqrt(cx_add(z, one)), cx_sqrt(cx_sub(z, one))))));
+  case -7:
+    t = cx_ln(cx_div(cx_add(one, z), cx_sub(one, z)));
+    return cx_clean(cx_of(t.re * 0.5, t.im * 0.5));
+  }
+  rt_error("DOMAIN ERROR: unknown circle function number for a complex value");
+  return one;
+}
+
+static void cx_chk(Cx z)
+{
+  (void)chk_num(z.re);
+  (void)chk_num(z.im);
+}
+
+/* would this real operation have a complex result? */
+static int real_to_cpx_mon(int id, double a)
+{
+  return id == P_LOG && a < 0.0;
+}
+static int real_to_cpx_dya(int id, double a, double b)
+{
+  switch (id) {
+  case P_POW: return a < 0.0 && b != floor(b);
+  case P_LOG: return (a < 0.0 || b < 0.0) && a != 1.0 && a != 0.0 && b != 0.0;
+  case P_CIRCLE:
+    if (a != floor(a)) return 0;
+    switch ((int)a) {
+    case 0: case -1: case -2: case -7: return fabs(b) > 1.0;
+    case 4: case -4: return b * b < 1.0;
+    case -6: return b < 1.0;
+    }
+  }
+  return 0;
+}
+
+static Cx cx_mon1(int id, Cx z)
+{
+  switch (id) {
+  case P_ADD: return cx_of(z.re, -z.im);
+  case P_SUB: return cx_of(-z.re, -z.im);
+  case P_MUL: {
+    double m = cx_abs(z);
+    return m == 0.0 ? cx_of(0.0, 0.0) : cx_of(z.re / m, z.im / m);
+  }
+  case P_DIV: return cx_div(cx_of(1.0, 0.0), z);
+  case P_POW: return cx_exp(z);
+  case P_LOG: return cx_ln(z);
+  case P_ABS: return cx_of(cx_abs(z), 0.0);
+  case P_CIRCLE: return cx_of(3.14159265358979323846 * z.re, 3.14159265358979323846 * z.im);
+  }
+  rt_error_s("DOMAIN ERROR: ", prim_name(id), " does not accept a complex value");
+  return z;
+}
+static int cx_eq(Cx a, Cx b) { return ct_eq(a.re, b.re) && ct_eq(a.im, b.im); }
+static Cx cx_dya1(int id, Cx a, Cx b)
+{
+  switch (id) {
+  case P_ADD: return cx_add(a, b);
+  case P_SUB: return cx_sub(a, b);
+  case P_MUL: return cx_mul(a, b);
+  case P_DIV: return cx_div(a, b);
+  case P_POW: return cx_pow(a, b);
+  case P_LOG:
+    if (a.re == 1.0 && a.im == 0.0) rt_error("DOMAIN ERROR: log base 1");
+    return cx_clean(cx_div(cx_ln(b), cx_ln(a)));
+  case P_EQ: return cx_of(cx_eq(a, b) ? 1.0 : 0.0, 0.0);
+  case P_NE: return cx_of(cx_eq(a, b) ? 0.0 : 1.0, 0.0);
+  case P_CIRCLE:
+    if (a.im != 0.0 || a.re != floor(a.re))
+      rt_error("DOMAIN ERROR: circle needs an integer function number");
+    return cx_circle((int)a.re, b);
+  }
+  rt_error_s("DOMAIN ERROR: ", prim_name(id),
+             " does not accept a complex value (complex numbers have no order)");
+  return a;
+}
+
+/* a T_CPX array whose imaginary parts are all zero becomes a T_NUM array */
+static Arr *cx_norm(Arr *r)
+{
+  int i;
+  Arr *q;
+  for (i = 0; i < r->n; i++) if (r->im[i] != 0.0) return r;
+  q = a_new(T_NUM, r->rank, r->shape);
+  for (i = 0; i < r->n; i++) q->num[i] = r->num[i];
+  a_rel(r);
+  return q;
+}
+
+static int any_to_cpx_mon(int id, const Arr *x)
+{
+  int i;
+  if (x->type != T_NUM) return 0;
+  for (i = 0; i < x->n; i++) if (real_to_cpx_mon(id, x->num[i])) return 1;
+  return 0;
+}
+static int any_to_cpx_dya(int id, const Arr *x, const Arr *y)
+{
+  int i, nx = x->rank == 0 ? 1 : x->n, ny = y->rank == 0 ? 1 : y->n;
+  int n = nx > ny ? nx : ny;
+  if (x->type != T_NUM || y->type != T_NUM) return 0;
+  if (x->rank != 0 && y->rank != 0 && x->n != y->n) return 0;
+  for (i = 0; i < n; i++)
+    if (real_to_cpx_dya(id, x->num[x->rank == 0 ? 0 : i], y->num[y->rank == 0 ? 0 : i]))
+      return 1;
+  return 0;
+}
+
+static Arr *cx_scalar_mon(int id, Arr *x)
+{
+  Arr *r = a_new(T_CPX, x->rank, x->shape);     /* arrays are reclaimed by the */
+  int i;                                        /* sweep if an error unwinds   */
+  for (i = 0; i < x->n; i++) {
+    Cx z = cx_mon1(id, cx_get(x, i));
+    cx_chk(z);
+    r->num[i] = z.re; r->im[i] = z.im;
+  }
+  return cx_norm(r);
+}
+static Arr *cx_scalar_dya(int id, Arr *x, Arr *y, int rank, const int *shp)
+{
+  int i;
+  Arr *r = a_new(T_CPX, rank, shp);
+  for (i = 0; i < r->n; i++) {
+    Cx z = cx_dya1(id, cx_get(x, x->rank == 0 ? 0 : i), cx_get(y, y->rank == 0 ? 0 : i));
+    cx_chk(z);
+    r->num[i] = z.re; r->im[i] = z.im;
+  }
+  return cx_norm(r);
+}
+
 static int is_scalar_dya(int id) { return id >= P_ADD && id <= P_NOR; }
 static int is_scalar_mon(int id)
 {
@@ -336,6 +591,7 @@ static Arr *scalar_mon(int id, Arr *x)
     }
     return a_simplify(r);
   }
+  if (x->type == T_CPX || any_to_cpx_mon(id, x)) return cx_scalar_mon(id, x);
   need_num(x, id);
   r = a_new(T_NUM, x->rank, x->shape);
   for (i = 0; i < x->n; i++) r->num[i] = smon(id, x->num[i]);
@@ -371,6 +627,23 @@ static Arr *scalar_dya(int id, Arr *x, Arr *y)
   }
   if (x->type == T_CHR || y->type == T_CHR) {
     if (id != P_EQ && id != P_NE) need_num(x->type == T_CHR ? x : y, id);
+  }
+  if (x->type == T_CPX || y->type == T_CPX || any_to_cpx_dya(id, x, y)) {
+    if (x->type == T_CHR || y->type == T_CHR) {
+      /* text against a complex number: equal never, not-equal always */
+      int rk = x->rank == 0 ? y->rank : x->rank;
+      const int *sh = x->rank == 0 ? y->shape : x->shape;
+      Arr *q = a_new(T_NUM, rk, sh);
+      for (i = 0; i < q->n; i++) q->num[i] = (id == P_NE) ? 1.0 : 0.0;
+      return q;
+    }
+    if (x->rank == 0) { shp = y->shape; rank = y->rank; }
+    else if (y->rank == 0) { shp = x->shape; rank = x->rank; }
+    else {
+      if (!a_same_shape(x, y)) rt_error("shape mismatch");
+      shp = x->shape; rank = x->rank;
+    }
+    return cx_scalar_dya(id, x, y, rank, shp);
   }
   if (x->rank == 0) { shp = y->shape; rank = y->rank; }
   else if (y->rank == 0) { shp = x->shape; rank = x->rank; }
@@ -849,6 +1122,7 @@ static Arr *grade_p(Arr *coll, Arr *x, int desc)
   Arr *r;
   int id = desc ? P_GRADEDN : P_GRADEUP;
   if (x->type == T_NEST) rt_error_s("DOMAIN ERROR: ", prim_name(id), " does not accept a nested value");
+  if (x->type == T_CPX) rt_error_s("DOMAIN ERROR: ", prim_name(id), " does not accept a complex value (complex numbers have no order)");
   if (x->rank == 0) rt_error_s("RANK ERROR: ", prim_name(id), " needs an array");
   n = x->shape[0];
   g_sort = x;
@@ -1257,8 +1531,14 @@ static Arr *matmul_p(Arr *x, Arr *y)
 {
   int sh[MAXRANK], rank, k, m, n, i, j, l;
   Arr *r;
-  need_num(x, P_MATMUL);
-  need_num(y, P_MATMUL);
+  int cpx = (x->type == T_CPX || y->type == T_CPX);
+  if (cpx) {
+    if ((x->type != T_NUM && x->type != T_CPX) || (y->type != T_NUM && y->type != T_CPX))
+      need_num(x->type == T_CPX || x->type == T_NUM ? y : x, P_MATMUL);
+  } else {
+    need_num(x, P_MATMUL);
+    need_num(y, P_MATMUL);
+  }
   if (x->rank < 1 || y->rank < 1)
     rt_error("DOMAIN ERROR: matmul needs arrays, not scalars");
   k = x->shape[x->rank - 1];
@@ -1271,7 +1551,7 @@ static Arr *matmul_p(Arr *x, Arr *y)
   if (rank > MAXRANK) rt_error("RANK ERROR");
   for (i = 0; i < x->rank - 1; i++) sh[i] = x->shape[i];
   for (j = 1; j < y->rank; j++) sh[x->rank - 1 + j - 1] = y->shape[j];
-  r = a_new(T_NUM, rank, sh);
+  r = a_new(cpx ? T_CPX : T_NUM, rank, sh);
   m = (k > 0) ? x->n / k : 0;
   if (k == 0) {
     m = 1;
@@ -1281,6 +1561,18 @@ static Arr *matmul_p(Arr *x, Arr *y)
   if (k == 0) {
     n = 1;
     for (j = 1; j < y->rank; j++) n *= y->shape[j];
+  }
+  if (cpx) {
+    for (i = 0; i < m; i++)
+      for (j = 0; j < n; j++) {
+        Cx s = cx_of(0.0, 0.0);
+        for (l = 0; l < k; l++)
+          s = cx_add(s, cx_mul(cx_get(x, i * k + l), cx_get(y, l * n + j)));
+        cx_chk(s);
+        r->num[i * n + j] = s.re;
+        r->im[i * n + j] = s.im;
+      }
+    return cx_norm(r);
   }
   for (i = 0; i < m; i++)
     for (j = 0; j < n; j++) {

@@ -891,10 +891,16 @@ static void sys_lib(void)
 /* ---------- workspace save ---------- */
 /* write an expression that rebuilds a nested array (strand form) */
 static void emit_expr(FILE *fp, const Arr *a);
+static void emit_numtxt(const Arr *a, int i, char *buf)
+{
+  if (a->type == T_CPX && a->im[i] != 0.0)
+    sprintf(buf, "%.15gJ%.15g", a->num[i], a->im[i]);
+  else sprintf(buf, "%.15g", a->num[i]);
+}
 static void emit_simple(FILE *fp, const Arr *a)
 {
   int i;
-  char buf[64];
+  char buf[96];
   if (a->type == T_CHR) {
     if (a->rank == 1 && a->n == 1) fprintf(fp, "(1) rho ");
     else if (a->rank != 1 && a->rank != 0) {
@@ -911,18 +917,18 @@ static void emit_simple(FILE *fp, const Arr *a)
     fprintf(fp, "'");
     return;
   }
-  if (a->rank == 0) { sprintf(buf, "%.15g", a->num[0]); fprintf(fp, "%s", buf); return; }
+  if (a->rank == 0) { emit_numtxt(a, 0, buf); fprintf(fp, "%s", buf); return; }
   if (a->rank > 1 || a->n <= 1) {
     fprintf(fp, "(");
     for (i = 0; i < a->rank; i++)
       fprintf(fp, "%s%d", i ? " " : "", a->shape[i]);
     fprintf(fp, ") rho ");
     if (a->n == 0) { fprintf(fp, "0"); return; }
-    if (a->n == 1) { sprintf(buf, "%.15g", a->num[0]); fprintf(fp, "%s", buf); return; }
+    if (a->n == 1) { emit_numtxt(a, 0, buf); fprintf(fp, "%s", buf); return; }
   }
   fprintf(fp, "(");
   for (i = 0; i < a->n; i++) {
-    sprintf(buf, "%.15g", a->num[i]);
+    emit_numtxt(a, i, buf);
     fprintf(fp, "%s%s", i ? " " : "", buf);
   }
   fprintf(fp, ")");
@@ -990,7 +996,7 @@ static void save_value(FILE *fp, const char *name, const Arr *a)
     return;
   }
   if (a->rank == 0) {
-    sprintf(buf, "%.15g", a->num[0]);
+    emit_numtxt(a, 0, buf);
     fprintf(fp, "%s\n", buf);
     return;
   }
@@ -999,11 +1005,11 @@ static void save_value(FILE *fp, const char *name, const Arr *a)
     for (i = 0; i < a->rank; i++) fprintf(fp, "%s%d", i ? " " : "", a->shape[i]);
     fprintf(fp, ") rho ");
     if (a->n == 0) { fprintf(fp, "0\n"); return; }
-    if (a->n == 1) { sprintf(buf, "%.15g", a->num[0]); fprintf(fp, "%s\n", buf); return; }
+    if (a->n == 1) { emit_numtxt(a, 0, buf); fprintf(fp, "%s\n", buf); return; }
   }
   fprintf(fp, "(");
   for (i = 0; i < a->n; i++) {
-    sprintf(buf, "%.15g", a->num[i]);
+    emit_numtxt(a, i, buf);
     fprintf(fp, "%s%s", i ? " " : "", buf);
   }
   fprintf(fp, ")\n");

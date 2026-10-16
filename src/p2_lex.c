@@ -11,6 +11,7 @@
 typedef struct Tok {
   int k;
   double num;
+  double im;                   /* imaginary part of a literal 3J4 */
   char *s;
 } Tok;
 
@@ -80,7 +81,7 @@ static Tok *lex(const char *line)
   const char *p = line;
   while (1) {
     int k = K_END, len = 0;
-    double v = 0.0;
+    double v = 0.0, vi = 0.0;
     char *s = NULL;
     while (is_space((unsigned char)*p)) p++;
     if (*p == '\0' || *p == '#') break;
@@ -112,6 +113,18 @@ static Tok *lex(const char *line)
       if (neg) v = -v;
       k = K_NUM;
       p = b + len;
+      /* complex literal  aJb  /  aJ-b */
+      if ((*p == 'J' || *p == 'j') &&
+          (num_start(p + 1) || (p[1] == '-' && num_start(p + 2)))) {
+        int ineg = (p[1] == '-');
+        const char *c = p + 1 + ineg;
+        int cl = num_len(c);
+        char *t2 = xstrndup(c, cl);
+        vi = strtod(t2, NULL);
+        free(t2);
+        if (ineg) vi = -vi;
+        p = c + cl;
+      }
     } else if (*p == '\'') {
       const char *q = p + 1;
       int m = 0;
@@ -177,11 +190,11 @@ static Tok *lex(const char *line)
       cap *= 2;
       t = (Tok *)xrealloc(t, sizeof(Tok) * (size_t)cap);
     }
-    t[n].k = k; t[n].num = v; t[n].s = s;
+    t[n].k = k; t[n].num = v; t[n].im = vi; t[n].s = s;
     n++;
-    t[n].k = K_END; t[n].s = NULL; t[n].num = 0;
+    t[n].k = K_END; t[n].s = NULL; t[n].num = 0; t[n].im = 0;
   }
-  t[n].k = K_END; t[n].s = NULL; t[n].num = 0;
+  t[n].k = K_END; t[n].s = NULL; t[n].num = 0; t[n].im = 0;
   return t;
 }
 
@@ -192,8 +205,13 @@ static Tok *lex_t(const char *line)
   trk_add(t, 1);
   return t;
 }
+/* selective assignment in progress (p4_eval.c); cleared when an error unwinds */
+static const Tok *sel_tok = NULL;
+static Arr *sel_idx = NULL;
+
 static void trk_unwind(int mark)
 {
+  sel_tok = NULL; sel_idx = NULL;
   while (ntrk > mark) {
     Trk e = trk[--ntrk];
     if (e.is_tok) {

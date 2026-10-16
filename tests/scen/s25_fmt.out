@@ -1,0 +1,45 @@
+   42
+    1
+    2
+    3
+    3.14
+    1.50    2.25
+  100.00    0.50
+   -1.00    7.00
+  1    2.5
+  3    4.5
+  5    6.5
+   1   2   3
+   4   5   6
+  1   2.0   3.0
+  4   5.0   6.0
+Total:  1234.50
+1,234,567.89
+
+   5
+00042
+42   |
+     1.235E4
+**
+hello
+ann        1
+bob        2
+ 7/05/86
+   1     2
+   3     4
+ 123.4
+  1        2
+  3        4
+  5.50CR
+ 1- 2-
+ 3- 4-
+1 2 3
+4 5 6
+1 2 3
+2 7
+DOMAIN ERROR: []FMT: unknown phrase in the format
+DOMAIN ERROR: []FMT: text needs an A phrase
+DOMAIN ERROR: []FMT: numbers need I, F, E or G
+LENGTH ERROR: []FMT: the columns have different lengths
+DOMAIN ERROR: []FMT: the data must be numbers or text
+*****
