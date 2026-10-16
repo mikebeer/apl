@@ -48,11 +48,15 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
      ['p2_lex.c', 'The tokenizer, and the registry that frees temporaries after an error'],
      ['p3_prim.c', 'The scalar and structural primitives, and the table of words'],
      ['p3b_ap.c', 'Auxiliary processors and shared variables: the hooks and the demonstration processors'],
-     ['p4_eval.c', 'Variables, user functions, control words, the parser and evaluator, the operators'],
-     ['p5_sys.c', 'The function editor, system functions and commands, workspaces, the session loop and `main`']],
+     ['p3c_fmt.c', '`[]FMT`: the format specification and the formatter'],
+     ['p3d_proc.c', 'The processors with real code: FILES, SCREEN, TCP and COMPFILE, and the platform-dependent parts (sockets, terminal)'],
+     ['p4_eval.c', 'Variables, user functions, control words, the parser and evaluator, the operators, selective assignment'],
+     ['p4b_oo.c', 'Namespaces, classes and instances: scopes, access rules, method dispatch, release of objects'],
+     ['p5_sys.c', 'The function editor, system functions and commands, workspaces, the session loop and `main`'],
+     ['p5b_oosys.c', 'The block parsers for `:Class`, `:Namespace` and `:Interface`, the object system functions, save and load of objects']],
     [2000, 7638], { mono: [0] });
   h2('Values');
-  p('A value is a reference-counted array with a type, a rank, a shape and its items. The type is one of three: `T_NUM` holds doubles, `T_CHR` holds characters, and `T_NEST` holds pointers to other values. After a function builds a nested array, `a_simplify` turns it into a numeric or character array if every item is a simple scalar, so there is one representation for each value.');
+  p('A value is a reference-counted array with a type, a rank, a shape and its items. The type is one of four: `T_NUM` holds doubles, `T_CPX` holds complex numbers as two arrays of doubles (real and imaginary parts), `T_CHR` holds characters, and `T_NEST` holds pointers to other values. After a function builds a nested array, `a_simplify` turns it into a numeric or character array if every item is a simple scalar, so there is one representation for each value.');
   h2('Evaluation');
   p('The evaluator is a recursive-descent parser that evaluates as it parses. `parse_expr` reads one operand (a strand of items), looks at the token after it, and decides whether it is a dyadic function, an operator or the end; if it is a function it evaluates everything to the right first, which is what gives right-to-left evaluation. Operators are looked up the same way, before their operands. A function written in braces is turned into a statement list once and cached by its text. Control words are recognized in a user function when it is first called: the matching `:End` of each is found by a scan and the jumps are stored with the function, so a loop costs no more than a branch.');
   h2('Errors');
@@ -73,7 +77,7 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
   const m2 = src.match(/static void ap_init\(void\)[\s\S]*?\n}\n/);
   const reg = m2[0].split('\n').filter(l => /UPPER|ap_init|^{|^}|ap_n = 0/.test(l)).join('\n');
   show('A processor: AP 2 (UPPER)', m1[0].replace(/\n$/, '') + '\n\n' + reg.replace(/\n$/, ''));
-  p('The numbers 124, 126 and 210 are registered with `installed` set to 0, which makes `[]SVO` refuse them. To install one, write its hooks, change the registration to `installed = 1` and rebuild. A processor in C can hold any state it needs; it can keep a file open, for instance, and make each assignment to its variable a write and each reference a read. The hooks run in the middle of the evaluation of a statement, so they should be quick and they must leave the arrays they were given alone.');
+  p('The number 126 is registered with `installed` set to 0, which makes `[]SVO` refuse it. To install a processor, write its hooks, register it with `installed = 1` and rebuild. The processors of Chapter 12 are registered the same way in `ap_init_extra` in `p3d_proc.c`; their hooks use the request protocol described there, which needs only a `set` hook that returns the result. A processor in C can hold any state it needs; it can keep a file open, for instance, and make each assignment to its variable a write and each reference a read. The hooks run in the middle of the evaluation of a statement, so they should be quick and they must leave the arrays they were given alone.');
 
   // ======================================================== 9
   chapter('Messages');
@@ -92,6 +96,8 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
      ['until: no convergence after 1000000 steps', 'The test of `until` never became true.'],
      ['auxiliary processor n (name) is reserved but not installed', 'A variable was offered to a number that has no code behind it.'],
      ['no such auxiliary processor: n', 'A variable was offered to a number that is not registered.'],
+     ['FILE ERROR: text', 'A file or component file operation failed: the file could not be opened, read, written, renamed or deleted, a handle is not open, or a component file is damaged. The C library\'s reason is added in parentheses.'],
+     ['NET ERROR: text', 'A TCP/IP operation failed: an address could not be resolved, a connection was refused, a handle is not open, or sockets are not available on this platform.'],
      ['ACCESS ERROR: text', 'A private member was used outside its class.'],
      ['READONLY ERROR: text', 'A read only field or a property without a set function was assigned.'],
      ['METHOD ERROR: text', 'An :Override has nothing to override, or a base method is replaced without :Override.'],
@@ -125,13 +131,13 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
   ]);
   h2('Language features that are not implemented');
   ul([
-    '**Complex numbers.** A function that would give one, such as the square root of a negative number, is a DOMAIN ERROR.',
+    '**Complex numbers** have no order and no factorial: see Chapter 6 for the functions that accept them. `floor`, `ceil` and `mod` of a complex number are not defined.',
     '**Objects** have no `:Trap`, `:Using`, `:Implements Constructor`, class-level `:Field` attributes beyond those of Chapter 11, multiple base classes, or operators in classes. A class that has live instances cannot be redefined. Events are delivered at once and not queued.',
-    '**Selective assignment** such as `(2 take v) <- ...`. Use indexed assignment or `amend`.',
+    '**Selective assignment** works only with the structural functions listed in Chapter 3, applied to one variable of simple or nested items at the top level; it does not reach into items of a nested array (`(1 pick 2 pick v) <- ...`), and a computation such as `(v plus 1) <- 3` is refused.',
     '**Operators written with a function header**, as in APL2. The `dop` form replaces them, and its operands must be functions.',
-    '**The []FMT function**, which has a complicated format specification. `format` covers the common cases.',
+    '**The P, R and S qualifiers of []FMT**, and the boxed display of nested arrays by the monadic form.',
     '**The control words** `:AndIf`, `:OrIf`, `:Trap`, `:With`, `:Section`, `:GoTo`, `:Access` and the rest of the Dyalog set.',
-    '**Namespaces, classes, files and the []FIO and []NA interfaces.** The auxiliary processors are the way to reach the outside, and no file or screen processor exists yet.',
+    '**The []FIO, []NA and []FHOLD interfaces.** Files, the screen and the network are reached through the auxiliary processors of Chapter 12, which also replace APL2\'s numbered AP interfaces; their commands are this interpreter\'s own.',
     '**Shared variables between programs.** The hooks connect a variable to a processor in the same process. `[]SVC`, `[]SVS`, `[]SVE`, `[]SVN` and the multi-user coupling states are not provided, and the value returned by `[]SVO` is always 1.',
     '**Dyalog primitives** for which no word exists: interval index (dyadic ⍸), stencil, variant, dyadic `⊂`, and left arguments to monadic operators other than those documented.',
     '**Other system names:** `[]LC`, `[]ML`, `[]FC`, `[]DR`, `[]CS`, `[]LX`, `[]ET`, `[]EM` and the rest not listed in Chapter 5.'
@@ -140,13 +146,13 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
   ul([
     'The words of the language are reserved. A program written before a word was added may have used it as a name: `first`, `left`, `right`, `log`, `rank`, `find`, `where`, `split`, `union`, `power`, `roll`, `deal`, `swap`, `repeat`, `until`, `format`, `execute`, `over`, `atop`, `amend`, `keyed`, `nest`, `ucs`, `zilch`, `dop` and `notmatch` are reserved.',
     '`[]DL` waits by spinning on the processor clock, which wastes the processor; it is meant for short pauses only.',
-    '`)SAVE` does not record which variables are shared; after `)LOAD` they are ordinary variables with their last values.',
+    '`)SAVE` records which variables are offered to which processor, but not what the processor holds: open files, sockets and component file handles are gone after `)LOAD`, and the program must open them again.',
     'A function that was interrupted by an error inside a `:For` loop leaves the loop’s variable set in the workspace, and a few bytes of memory for the loop are not released until the interpreter ends.',
     'The random number generator is a 32-bit xorshift. It gives the same numbers on every platform for the same `[]RL` but is not the generator of any other APL.',
     '`[]PP` counts decimal places, not significant digits, so very small numbers print as 0 unless `[]PP` is raised. Large numbers print in exponent form.'
       ]);
   h2('Still to do for VM/370');
-  p('The language is complete enough for the port to begin, and the port is the next step. It needs: a deck-build step that folds the roughly one hundred source lines longer than 71 columns; a declaration of `setjmp` for GCCLIB under `__CMS__`; a single TEXT file for the loader; and a test on a Hercules VM/370 system. The first auxiliary processor to write there will be AP210, the CMS file system.');
+  p('The language is complete enough for the port to begin, and the port is the next step. It needs: a deck-build step that folds the roughly one hundred source lines longer than 71 columns; a declaration of `setjmp` for GCCLIB under `__CMS__`; a single TEXT file for the loader; and a test on a Hercules VM/370 system. FILES and COMPFILE use only the C library (`fopen`, `fread`, `fwrite`), so they run wherever that does; the directory listing needs POSIX. TCP and SCREEN use a platform layer inside `p3d_proc.c` (BSD sockets and `termios`, guarded by `APL_HAVE_SOCKETS` and `APL_HAVE_TERMIOS`); without them the commands fail with a clear message. On CMS the TCP commands would be written against the TCP/IP for VM socket interface, and SCREEN against 3270 full-screen I/O, in the same two places.');
 
   // ======================================================== Appendices
 
@@ -204,6 +210,81 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
   p('The program below defines a namespace Bank with a class Account that has a shared count, a read only property and an event, and a class Savings derived from it. It makes two accounts, attaches a handler to the Overdrawn event and shows the property protecting the balance.');
   run('Objects (examples/oo_account.apl)', 'examples/oo_account.apl');
 
+
+  // ======================================================== 12
+  chapter('Auxiliary Processors and Communications');
+  p('Chapter 5 describes shared variables: a variable is offered to a numbered processor, and the processor decides what a reference to it returns and what an assignment to it does. This chapter describes four processors that do real work: files, component files, the screen and TCP/IP. They share one protocol, so that once you know how to use one, you know how to use the others.');
+  h2('The request and result protocol');
+  p('You make a **request** by assigning to the shared variable: either a text that names a command, or a vector whose first item is that text and whose other items are the arguments. The processor carries the request out when the assignment is made, and the variable then holds the **result**, which you read like any variable. A request that cannot be carried out stops with an error, which `[]EA` can catch. Command names are not case sensitive.');
+  snip('The protocol', "100 []SVO 'F'\nF <- 'open' 'protocol.tmp' 'w'\nh <- F\nF <- 'writeline' h 'one line'\nF\nF <- 'close' h\nF <- 'size' 'protocol.tmp'\nF\nF <- 'delete' 'protocol.tmp'\n('execute ''F <- ''''bogus''''''' []EA '[]DM')");
+  p('A request is a strand, so a text argument is a quoted text, a number is a number, and an argument that is itself an expression must be put in parentheses: `F <- \'writeline\' h (\'total \' cat format n)`. Results that mean “nothing there” (the end of a file, no data from a socket) are `zilch`, an empty numeric vector; an empty text is a real empty line.');
+  h2('AP 100: FILES');
+  table('FILES commands',
+    ['Request', 'Result'],
+    [['\'open\' name [mode]', 'A handle (1 to 32). The mode is r (the default), w, a, r+, w+ or a+. Files are read and written byte for byte.'],
+     ['\'close\' h', '1.'],
+     ['\'readline\' h', 'The next line without its line end, or zilch at the end of the file.'],
+     ['\'read\' h n', 'Up to n characters, or zilch at the end of the file.'],
+     ['\'write\' h text  \'writeline\' h text', 'The number of characters written; `writeline` adds a line end.'],
+     ['\'seek\' h pos [whence]', 'Moves to pos (counted from the start; whence 1 is from the current place, 2 from the end). Returns the new place.'],
+     ['\'tell\' h  \'eof\' h  \'flush\' h', 'The place; 1 if the end of the file has been reached; 1.'],
+     ['\'size\' h  or  \'size\' name', 'The size of the file in bytes.'],
+     ['\'readall\' name  \'lines\' name', 'The whole file as one text vector (line ends are the character with code 10), or as a matrix with a row for each line.'],
+     ['\'exists\' name  \'delete\' name  \'rename\' old new', '1 or 0; 1; 1.'],
+     ['\'dir\' [pattern]', 'A matrix of the file names that match the pattern (`*` and `?`); sorted. Not on every platform.'],
+     ['\'handles\'', 'The open handles.']],
+    [3600, 6038], { mono: [0] });
+  h2('AP 210: COMPFILE');
+  p('A component file keeps numbered APL values, of any shape and depth, in a file. The file is text, so it can be moved between machines and read with an editor. Components are numbered from 1. An object reference cannot be stored.');
+  table('COMPFILE commands',
+    ['Request', 'Result'],
+    [['\'create\' name  \'open\' name', 'A handle (1 to 16). `create` makes an empty file and fails if the file is there.'],
+     ['\'close\' h', '1.'],
+     ['\'append\' h value', 'The number of the new component.'],
+     ['\'read\' h n', 'Component n.'],
+     ['\'replace\' h n value', 'n. The file is rewritten.'],
+     ['\'drop\' h', 'Removes the last component; returns the new count.'],
+     ['\'count\' h', 'The number of components.'],
+     ['\'exists\' name  \'erase\' name', '1 or 0; 1.']],
+    [3600, 6038], { mono: [0] });
+  snip('Component files', "210 []SVO 'C'\nC <- 'create' 'demo.cf'\nh <- C\nC <- 'append' h (2 3 rho iota 6)\nC <- 'append' h ('ab' (1 2 3) (4J5 6))\nC <- 'append' h 'plain text'\nC <- 'count' h\nC\nC <- 'read' h 2\nC\nC <- 'replace' h 3 'changed'\nC <- 'close' h\nC <- 'open' 'demo.cf'\nh <- C\nC <- 'read' h 3\nC\nC <- 'close' h\nC <- 'erase' 'demo.cf'");
+  h2('AP 124: SCREEN');
+  p('SCREEN controls a terminal that understands ANSI escape sequences (VT100, xterm and nearly everything since). Rows and columns are counted from 1 at the top left. It writes to standard output and reads keys from standard input, so a program can be tested with a file as input; on a terminal it switches the keyboard to character mode for the keys, and restores it at the end of the session.');
+  table('SCREEN commands',
+    ['Request', 'Effect and result'],
+    [['\'clear\'', 'Erases the screen and moves the cursor to the top left.'],
+     ['\'put\' row col text', 'Writes the text at that place; returns its length.'],
+     ['\'cursor\' row col', 'Moves the cursor.'],
+     ['\'attr\' n ...', 'Sets the display attributes: 0 normal, 1 bold, 4 underline, 7 reverse, 30 to 37 colours, 40 to 47 background colours. With no numbers: normal.'],
+     ['\'box\' row col h w', 'Draws a frame h rows high and w columns wide with + - and |.'],
+     ['\'size\'', 'The number of rows and columns: from the environment variables LINES and COLUMNS, otherwise 24 and 80.'],
+     ['\'getkey\' [ms]', 'Waits for a key and returns its code; 0 if the time out ran out, −1 at the end of the input. Enter is 13, backspace 8, escape 27, and 1001 up, 1002 down, 1003 right, 1004 left, 1005 home, 1006 end, 1007 delete, 1008 page up, 1009 page down.'],
+     ['\'input\' row col len [text]', 'Edits a field of len characters, starting with the text; returns what was entered. Enter ends it; escape clears it. Without a terminal, a line of input is read.'],
+     ['\'bell\'  \'flush\'  \'hide\'  \'show\'  \'reset\'', 'Sounds the bell; writes pending output; hides or shows the cursor; restores the normal attributes, the cursor and the keyboard.']],
+    [3600, 6038], { mono: [0] });
+  h2('AP 160: TCP');
+  p('TCP gives a program the same sockets that other languages use. A connection is a handle (1 to 32). The commands that wait take a time out in milliseconds; without one they wait for ever. A server is a loop around `accept`, `recvline` and `send`; a client is `connect`, `send` and `recvline`.');
+  table('TCP commands',
+    ['Request', 'Result'],
+    [['\'connect\' host port', 'A handle for a connection to the host (a name or a numeric address).'],
+     ['\'listen\' port [address]', 'A handle that is waiting for clients on that port; port 0 takes any free port, and `port` tells which.'],
+     ['\'accept\' h [ms]', 'The handle of the next client, or 0 if the time out ran out.'],
+     ['\'send\' h text', 'The number of characters sent.'],
+     ['\'recv\' h n [ms]', 'Up to n characters, as soon as some have arrived. Zilch if none came within the time out, or if the other side has closed.'],
+     ['\'recvline\' h [ms]', 'One line without its line end (CR LF or LF); zilch as for `recv`. A partial line is kept for the next call.'],
+     ['\'poll\' h [ms]', '1 if there is something to read (or a client to accept), else 0.'],
+     ['\'status\' h', '1 once the other side has closed and everything has been read.'],
+     ['\'port\' h  \'peer\' h', 'The local port number; the address and port of the other side, as text.'],
+     ['\'resolve\' host', 'The numeric address of a host name, as text.'],
+     ['\'close\' h  \'handles\'', '1; the open handles.']],
+    [3600, 6038], { mono: [0] });
+  p('The program below is a complete exchange in one session: a server listens on a free port, a client connects to it, the server answers. On the loopback address the connection completes without a second process, which makes it a good test; with two sessions, the same requests make a real server and a real client.');
+  run('TCP on the loopback (examples/net_echo.apl)', 'examples/net_echo.apl');
+  p('TCP is written for POSIX sockets, which Linux, the BSD systems and macOS provide. On a platform without them every TCP request is a NET ERROR that says so. Because the protocol is the same, a port to another stack changes only the platform layer in `p3d_proc.c`.');
+  h2('Writing a processor with the same protocol');
+  p('A processor needs only a `set` hook. It receives the request, parses it with `rq_parse` (the command is lower case in `q.cmd`; `rq_str`, `rq_int` and `rq_num` fetch the arguments), does the work, and returns the result as a new value; whatever it returns becomes the value of the variable. Register it in `ap_init_extra` with a free number. Raise errors with `rt_error`, and do not keep an `Arr *` in a static variable: the interpreter reclaims values that no variable holds after an error.');
+  show('A processor in six lines', "static Arr *echo_set(const char *var, Arr *val)\n{\n  Rq q;\n  (void)var;\n  rq_parse(val, &q);                 /* q.cmd, q.n arguments */\n  return res_text(q.cmd, (int)strlen(q.cmd));\n}\n\n/* in ap_init_extra: */\nap_register(300, \"ECHO\", 1, NULL, NULL, echo_set, NULL);");
+
   chapter('Appendix A. Commands', { plain: true, appendix: true });
   table('Commands',
     ['Command', 'Action'],
@@ -253,7 +334,10 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
     [4800, 4838]);
   table('Differences in behavior',
     ['Topic', 'Difference'],
-    [['Complex numbers', 'Not supported.'],
+    [['Complex numbers', 'Supported, written `3J4`; the J form is also what is printed. No complex floor, ceiling, residue or factorial.'],
+     ['`[]FMT`', 'The common APL2 phrases and qualifiers (I F E G A X T, B C L Z K M N); the P, R and S qualifiers are missing.'],
+     ['Selective assignment', 'Structural selections of one variable; see Chapter 3.'],
+     ['Auxiliary processors', 'The numbered processors 100, 124, 160 and 210 are this interpreter\'s own and use a request/result protocol (Chapter 12); they are not compatible with the IBM processors of the same numbers.'],
      ['`[]PP`', 'Counts decimal places, not significant digits.'],
      ['Nested display', 'No boxes or indentation: an array item has a blank before it.'],
      ['`keyed`, `amend`', 'Keyed takes a vector of keys. Amend works on vectors, with an index list only.'],

@@ -23,6 +23,8 @@ and auxiliary processors. It is meant to run later on VM/370 (CMS).
     src/p2_lex.c    tokenizer
     src/p3_prim.c   scalar and structural primitives (any rank <= 8)
     src/p3b_ap.c    shared variables / auxiliary processors (hooks + demo processors)
+    src/p3c_fmt.c   []FMT
+    src/p3d_proc.c  processors with real code: FILES, SCREEN, TCP, COMPFILE
     src/p4_eval.c   variables, user functions, parser/evaluator, operators
     src/p4b_oo.c    namespaces, classes, instances: scopes, access, dispatch, GC
     src/p5_sys.c    nabla editor, ) commands, workspaces, REPL, main
@@ -74,11 +76,11 @@ gcclib31/src -D__CMS__ -D__CHAR_UNSIGNED__`). Not yet run on real CMS.
 
 ## Not done yet
 
-Complex numbers, `[]FMT`, selective assignment, operators written with a
-function header (use `dop`), files and screen processors (AP210, AP124,
-AP126 are reserved numbers), and the CMS build (deck step for lines over
-71 columns, `setjmp` declaration, Hercules test).  Chapter 10 of the manual
-has the full list.
+Operators written with a function header (use `dop`), `[]FIO`/`[]NA`, the
+P/R/S qualifiers of `[]FMT`, AP126, and the CMS build (deck step for lines
+over 71 columns, `setjmp` declaration, Hercules test; FILES and COMPFILE
+need only the C library, TCP and SCREEN need a CMS platform layer).
+Chapter 10 of the manual has the full list.
 
 ## Nested arrays (APL2) -- v0.2
 
@@ -184,3 +186,23 @@ events, in the Dyalog manner.  Classic programs are unaffected.
 * `)SAVE`, `)LOAD`, `)COPY` keep namespaces, classes and instances.
 * Example: `examples/oo_account.apl`; tests `tests/scen/s15`..`s22`;
   manual Chapter 11.
+
+## Complex numbers, selective assignment, []FMT, processors -- v0.6
+
+* **Complex numbers**: literals `3J4`, arithmetic, power/exp/ln/log, circular
+  and hyperbolic functions and their inverses, conjugate, magnitude, `9 10 11
+  12 circle z`, `matmul`, `reduce`, `scan`, `outer`; a real argument outside
+  the real domain gives a complex result (`(neg 4) power 0.5` is `0J2`).
+* **Selective assignment**: `(2 take v) <- 0`, `((v > 3) compress v) <- 0`,
+  `(reverse v) <- w`; with take, drop, reverse, rotate, transpose, ravel,
+  compress, expand, rho, pick, first, disclose, index.
+* **`[]FMT`**: `'F8.2' []FMT x`, phrases I F E G A X T and text, repeat
+  groups, qualifiers B C L Z K M N; `[]FMT x` is the display as a matrix.
+* **Processors with real code**, one request/result protocol: assign a
+  command vector to the shared variable, read the result back.
+  100 FILES (`'open' name 'w'`, `'readline' h`, `'dir' '*.apl'`, ...),
+  124 SCREEN (ANSI full screen, key codes, input fields),
+  160 TCP (`'listen' 0`, `'connect' host port`, `'send'`, `'recv'`,
+  `'recvline'`, time outs), 210 COMPFILE (numbered APL values in a file).
+* Examples `examples/report.apl`, `examples/net_echo.apl`; tests
+  `tests/scen/s23`..`s29`; manual Chapters 3, 5, 6 and the new Chapter 12.

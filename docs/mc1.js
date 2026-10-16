@@ -33,7 +33,7 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
     '**System variables and functions** such as `[]IO`, `[]CT`, `[]EA` (try/catch) and `[]SIGNAL`, and **workspaces** that can be saved, loaded and copied.',
     '**Shared variables and auxiliary processors.** The hooks are present, with three demonstration processors; Chapter 8 shows how to add one.'
   ]);
-  p('The interpreter is not a full APL2 or Dyalog. There are no complex numbers, no `[]FMT`, no selective assignment, no files and no full-screen support yet. Chapter 10 and Appendix C list what is missing and what differs.');
+  p('The interpreter is not a full APL2 or Dyalog. Chapter 10 and Appendix C list what is missing and what differs.');
   h2('How the pieces fit together');
   p('The interpreter is built once from the C sources. After that, any number of programs can be run. The figure below lists the steps.');
   table('From source to output',
@@ -77,12 +77,15 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
   p('A number is written with digits, a decimal point and an exponent: `42`, `3.14`, `1e6`. A negative number is written with the function `neg`, as in `neg 5`, or with a leading minus sign, as in `- 5`. Numbers are stored as double-precision floating-point values. The system variable `[]PP` sets how many places after the decimal point are shown (default 6), and trailing zeros are not printed.');
   p('Text is written between single quotes. Two quotes inside a text stand for one: `\'it\'\'s\'` is the four characters `it\'s`. A text of one character is a scalar; any other length is a vector. There is no separate string type: text is an array of characters, and every array function works on it.');
   snip('Numbers and text', "'it''s'\nrho 'it''s'\n1 divide 3\n123456789 times 10\nneg 1.5 2\n1e10 times 1e10\n[]PP <- 2\n1 divide 3");
+  p('A **complex number** is written with a J between its parts: `3J4`, `1.5J-2`. A negative real part is written with `-` or `neg` as usual. Chapter 6 describes how the functions treat them.');
   h2('Evaluation, right to left');
   p('A statement is evaluated from right to left. Every function takes everything to its right as its right argument. `2 times 3 plus 4` is `2 times (3 plus 4)`, which is 14. There is no precedence among functions; use parentheses to change the order.');
   snip('Right to left', '2 times 3 plus 4\n(2 times 3) plus 4\n10 minus 3 minus 2\n(10 minus 3) minus 2');
   p('A function called with a value to its left is **dyadic**; one with no left value is **monadic**. Most words have both forms with related meanings: `neg 5` is minus five, `7 minus 5` is two.');
   h2('Variables and assignment');
   p('`name <- expression` assigns. An assignment prints nothing. A name that has no value gives `undefined variable`. Variables live in the workspace until `)CLEAR`, `)ERASE` or `[]EX` removes them. Elements of an array can be assigned by index, `m[2;3] <- 0`; Chapter 4 describes this.');
+  p('Part of an array can be assigned by **selective assignment**: a selection of the variable, in parentheses, on the left of the arrow. `(2 take v) <- 0` sets the first two items to 0, `((v > 3) compress v) <- 0` clears the items above 3, and `(reverse v) <- w` assigns w backwards. The selection may use `take`, `drop`, `reverse`, `rotate`, `transpose`, `ravel`, `compress`, `expand`, `rho`, `pick`, `first`, `disclose` and `index`, applied to the variable and to nothing else; the variable is the rightmost name in the parentheses. The right side must be a scalar or have the same shape as the selection.');
+  snip('Selective assignment', "v <- 1 2 3 4 5 6\n(2 take v) <- 0\nv\n((v > 3) compress v) <- 9\nv\n(reverse v) <- iota 6\nv\nm <- 3 3 rho iota 9\n(transpose m) <- 3 3 rho 0\nm");
   h2('Defining functions');
   p('A function is defined in the line editor. The word `nabla` on a line of its own, followed by a header, starts the editor; the next `nabla` ends it. The header names the function, its arguments and its result:');
   table('Function headers',

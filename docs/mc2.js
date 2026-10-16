@@ -55,6 +55,32 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
      ['[]DL secs', 'Waits that many seconds, up to 3600, by spinning on the clock; returns the time waited.'],
      ['[]VFI \'text\'', 'Validates and fixes input: returns a pair, a vector of 1s and 0s that says which blank-separated words are numbers, and the numbers (0 for the others).']],
     [2800, 6838], { mono: [0] });
+  h2('Formatted output: []FMT');
+  p('`spec []FMT data` formats numbers and text by a specification and returns a character matrix. `[]FMT data` alone returns the display of the data as a character matrix. The specification is a text of phrases separated by commas; each phrase formats one column of the data, and the list starts again if there are more columns than phrases. A phrase may be repeated with a count, `3F8.2`, and a group with `2(I3,\'|\')`. Text in the specification is written between quotes, which in a text are doubled.');
+  table('[]FMT phrases',
+    ['Phrase', 'Meaning'],
+    [['Iw', 'A whole number (rounded) in a field w wide; w of 0 gives the natural width.'],
+     ['Fw.d', 'A fixed-point number with d decimals in a field w wide. The field is filled with asterisks if the number does not fit.'],
+     ['Ew.d', 'Exponent form with d significant digits: `1.235E4`.'],
+     ['G\'pattern\'', 'A whole number laid out by a pattern; each 9 takes a digit from the right, as in `G\'99/99/99\'`.'],
+     ['Aw', 'Text. A text item (a vector or a matrix, one row of text per line) takes one A phrase and w characters.'],
+     ['Xw', 'w blanks.'],
+     ['Tc', 'Move to column c (an absolute tab).'],
+     ['\'text\'', 'The text is inserted.']],
+    [2000, 7638], { mono: [0] });
+  table('[]FMT qualifiers (before the letter)',
+    ['Qualifier', 'Meaning'],
+    [['B', 'Blank if the value is zero.'],
+     ['C', 'Commas between thousands.'],
+     ['L', 'Left-justify in the field.'],
+     ['Z', 'Fill with zeros instead of blanks.'],
+     ['Kn', 'Multiply by 10 to the n before formatting (K-2 divides by 100).'],
+     ['M\'text\'', 'A negative number shows the text after it, in place of a minus sign: `M\'CR\'F8.2`.'],
+     ['N\'text\'', 'A negative number shows the text before it, in place of a minus sign.']],
+    [2000, 7638], { mono: [0] });
+  p('The data may be a scalar, a vector (one column) or a matrix (one column per column). A nested vector gives one block of columns for each item, which is how numbers and text are put side by side: `\'A8,I4,F9.2\' []FMT names qty price` needs the three as items of one vector, `(names) (qty) (price)`, where names is a character matrix. A numeric scalar is repeated on every row. A text vector is one row of text. The P, R and S qualifiers of APL2 are not provided.');
+  snip('[]FMT', "'I5' []FMT 1 2 3\n'F8.2' []FMT 3 2 rho 1.5 2.25 100 0.5 (neg 1) 7\n'CF12.2' []FMT 1234567.891\n'M''CR'' F8.2' []FMT neg 5.5\n'ZI5,X2,E10.3' []FMT 2 2 rho 42 12345.678 7 0.00123\n'A8,I4' []FMT (2 4 rho 'ann bob ') (1 2)");
+  run('A report with []FMT, complex numbers and selective assignment (examples/report.apl)', 'examples/report.apl');
   snip('Functions defined at run time', "rows <- 'Z<-DOUBLE N' 'Z<-N plus N'\n[]FX rows\nDOUBLE 21\n[]NC 'DOUBLE'\n[]CR 'DOUBLE'\n[]EX 'DOUBLE'\n[]NC 'DOUBLE'");
   h2('System commands');
   p('A line that starts with a right parenthesis is a system command and is not part of the language. Appendix A lists them all. The ones you will use most are `)VARS` and `)FNS` to list what is defined, `)CLEAR` to start again, `)SAVE`, `)LOAD` and `)COPY` for workspaces, and `)QUIT`.');
@@ -71,15 +97,17 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
      ['[]SVQ n', 'The names currently shared with processor n.'],
      [')PROCS', 'A system command: lists the processors, and what is shared with each.']],
     [2800, 6838], { mono: [0] });
-  p('This release has the hooks and three demonstration processors, listed in the figure below. Numbers 124, 126 and 210 are reserved for processors that have not been written yet; offering a variable to one of them is an error. Chapter 8 explains how to add a processor of your own.');
+  p('This release has the hooks, three demonstration processors and four processors with real code, listed in the figure below. Number 126 is reserved for a processor that has not been written yet; offering a variable to it is an error. The four real processors share one protocol, described in Chapter 12; Chapter 8 explains how to add a processor of your own.');
   table('Processors in this release',
     ['No.', 'Name', 'Behavior'],
     [['1', 'LOOPBACK', 'Does nothing: a shared variable simply holds its value. Useful for testing the coupling.'],
      ['2', 'UPPER', 'Text assigned to a shared variable is changed to capitals; other values are rejected.'],
      ['3', 'COUNTER', 'Every reference to the variable yields the next whole number; assigning a number sets the counter.'],
-     ['124', 'AP124', 'Reserved, not installed.'],
+     ['100', 'FILES', 'Text and binary files: open, read, write, seek, rename, delete, directory listing.'],
+     ['124', 'SCREEN', 'Full-screen output and keyboard on an ANSI terminal: positioned text, attributes, frames, key codes, input fields.'],
      ['126', 'AP126', 'Reserved, not installed.'],
-     ['210', 'AP210', 'Reserved, not installed.']],
+     ['160', 'TCP', 'TCP/IP: client and server sockets, with time outs.'],
+     ['210', 'COMPFILE', 'Component files: numbered APL values, of any shape and depth, kept in a file.']],
     [900, 1700, 7038], { mono: [0, 1] });
   run('Shared variables (examples/procs.apl)', 'examples/procs.apl');
   p('The offer is made for the variable, not for the value. Erasing a shared variable, or clearing the workspace, retracts the offer. A shared variable cannot be a function.');
@@ -124,9 +152,24 @@ module.exports = ({ chapter, h2, h3, p, ul, fig, run, snip, show, table, fs, pat
      ['5', 'sinh x', '−5', 'arcsinh x'],
      ['6', 'cosh x', '−6', 'arccosh x'],
      ['7', 'tanh x', '−7', 'arctanh x'],
-     ['9', 'x', '10', 'abs x']],
+     ['9', 'real part of x', '10', 'abs x'],
+     ['11', 'imaginary part of x', '12', 'phase of x (the angle)']],
     [900, 3919, 900, 3919]);
   snip('Scalar functions (examples/scalar.apl)', fs.readFileSync(path.join(ROOT, 'examples/scalar.apl'), 'utf8').replace(/^#.*\n/, ''));
+  h2('Complex numbers');
+  p('A number with an imaginary part is a complex number. It is written `aJb` and printed the same way. Complex and real numbers mix freely in an array: `1 2J3 4` is a three-item vector. A result whose imaginary part is zero is an ordinary real number. A square root, power or logarithm that has no real answer gives a complex one instead of an error: `(neg 4) power 0.5` is `0J2`, and `ln neg 1` is `0J3.141593`.');
+  table('Functions on complex numbers',
+    ['Function', 'Result'],
+    [['plus, minus, times, divide', 'The usual complex arithmetic. `plus z` (monadic) is the conjugate; `neg`, `signum` (z divided by its magnitude) and `recip` work too.'],
+     ['abs z', 'The magnitude. `9 circle z`, `11 circle z` and `10 circle z` give the real part, the imaginary part and the magnitude; `12 circle z` is the phase.'],
+     ['power, exp, ln, log', 'Complex power, exponential, natural logarithm and logarithm to any base. Whole exponents up to 64 are computed by multiplication and are exact.'],
+     ['circle', 'Circular and hyperbolic functions 1 to 7 and their inverses, and 0 and ±4, for complex arguments. Real arguments outside the real domain, such as `-1 circle 2`, give a complex result.'],
+     ['= and <>', 'Compare both parts, within []CT. A complex number is never equal to a character.'],
+     ['matmul, inner, reduce, scan, outer, each', 'Work on complex arrays.'],
+     ['take, drop, reverse, rotate, transpose, cat, index, pick, first, member, indexof, unique, match, ...', 'The structural functions work on complex arrays like any others.']],
+    [2800, 6838], { mono: [0] });
+  p('Complex numbers have no order, so `<`, `>`, `max`, `min`, `floor`, `ceil`, `mod`, `gradeup` and `gradedown` are a DOMAIN ERROR on them; so are `fact`, `roll`, `and`, `or` and the conversion functions. `)SAVE` writes complex numbers in the `aJb` form.');
+  snip('Complex numbers', "z <- 3J4\nabs z\n+z\nz times z\nz divide 1J1\n(neg 4) power 0.5\nexp 0J3.141592653589793\n1 2J3 4\n11 circle 1 2J3 4\nreduce times 1J1 1J1 1J1");
   h2('Structure functions');
   table('Shape and structure',
     ['Word', 'Glyph', 'Monadic', 'Dyadic'],
